@@ -1,33 +1,30 @@
-"""Rising Assets Strategy — Streamlit Backtester (v5)
+"""Rising Assets Strategy — Streamlit Backtester (v5.1)
 
-Key features
-- Streamlit UI (local or hosted)
-- In-memory caching for price downloads and backtest results
-- Monthly rebalance strategy with look-ahead fix:
+Fixes vs v5
+- Adds guardrail + valuation forward-fill to prevent spurious near-zero equity caused by missing prices.
+- Makes start/end inputs robust (explicit min/max + widget keys).
+- Makes Streamlit caching keys robust by passing start/end as ISO strings.
+
+Core model
+- Monthly rebalance with look-ahead fix:
     * Signal computed as-of prior month-end trading day (t-1)
     * Trades executed at month-end trading day close (t)
-- Daily equity curve (mark-to-market) for metrics and drawdowns
-- Optional transaction costs: £5 per non-zero ticker trade line item
-- Excel export (tables + optional embedded PNG charts if Kaleido installed)
+- Uses adjusted closes from Yahoo Finance via yfinance (auto_adjust=True).
+- Cash earns 0%.
 
 Dependencies
     pip install streamlit yfinance pandas numpy xlsxwriter plotly
-Optional for PNG chart export into Excel:
+Optional for embedding PNG charts into Excel:
     pip install kaleido
-
-Notes
-- Uses yfinance with auto_adjust=True and Close prices.
-- Cash earns 0%.
 """
 
 from __future__ import annotations
 
 import io
 import math
-import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Tuple
+from datetime import date, datetime
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,28 +55,23 @@ def parse_universe(text: str) -> List[str]:
     return out
 
 
-def _month_end_trading_days(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+def month_end_trading_days(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Return the last trading day for each (year, month) present in index."""
     if not isinstance(index, pd.DatetimeIndex):
         index = pd.to_datetime(index)
     idx = pd.DatetimeIndex(index).sort_values().unique()
     if len(idx) == 0:
         return idx
-    # Group by month period and take max date
     s = pd.Series(idx, index=idx)
     month_last = s.groupby(idx.to_period("M")).max().sort_values()
     return pd.DatetimeIndex(month_last.values)
-
-
-def _ensure_datetime(d) -> pd.Timestamp:
-    return pd.Timestamp(d).normalize() if not isinstance(d, pd.Timestamp) else d.normalize()
 
 
 # =========================
 # Data fetch + cleaning
 # =========================
 
-def _normalize_prices_to_gbp(prices: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+def normalize_prices_to_gbp(prices: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
     """Normalize prices to GBP: if yfinance reports currency 'GBp' (pence), divide by 100."""
     normalized = prices.copy()
     for ticker in tickers:
@@ -88,7 +80,6 @@ def _normalize_prices_to_gbp(prices: pd.DataFrame, tickers: List[str]) -> pd.Dat
         try:
             tobj = yf.Ticker(ticker)
             currency = ""
-            # Try info dict first
             try:
                 info = getattr(tobj, "info", None)
                 if isinstance(info, dict):
@@ -105,25 +96,25 @@ def _normalize_prices_to_gbp(prices: pd.DataFrame, tickers: List[str]) -> pd.Dat
             if currency == "GBp":
                 normalized[ticker] = normalized[ticker] / 100.0
         except Exception:
-            # Best-effort only
             pass
     return normalized
 
 
 @st.cache_data(show_spinner=False)
 def fetch_price_data_robust_cached(
-    tickers: Tuple[str, ...], start_date: pd.Timestamp, end_date: pd.Timestamp
+    tickers: Tuple[str, ...], start_iso: str, end_iso: str
 ) -> pd.DataFrame:
     """Fetch adjusted close prices (Close) using yfinance, with fallback downloads.
 
     Cached in-memory per Streamlit process.
+    Uses ISO date strings for stable Streamlit caching keys.
     """
     tlist = [t for t in tickers if t]
     if not tlist:
         raise ValueError("No tickers provided.")
 
-    start_date = pd.Timestamp(start_date)
-    end_date = pd.Timestamp(end_date)
+    start_date = pd.Timestamp(start_iso)
+    end_date = pd.Timestamp(end_iso)
 
     try:
         data = yf.download(
@@ -144,20 +135,20 @@ def fetch_price_data_robust_cached(
                 raise ValueError(f"No Close column for {tlist[0]}")
             prices[tlist[0]] = data["Close"].copy()
         else:
-            # MultiIndex columns: (ticker, field)
             for t in tlist:
                 if hasattr(data.columns, "levels") and t in data.columns.levels[0]:
                     if "Close" in data[t].columns:
                         prices[t] = data[t]["Close"].copy()
+
         prices.index = pd.to_datetime(prices.index)
         prices = prices.sort_index()
         prices = prices.dropna(axis=1, how="all")
         if prices.shape[1] == 0:
             raise ValueError("Could not extract price data from any ticker.")
-        prices = _normalize_prices_to_gbp(prices, list(prices.columns))
+        prices = normalize_prices_to_gbp(prices, list(prices.columns))
         return prices
+
     except Exception:
-        # Fallback to per-ticker download
         prices_dict: Dict[str, pd.Series] = {}
         for t in tlist:
             d = yf.download(
@@ -176,12 +167,12 @@ def fetch_price_data_robust_cached(
         prices.index = pd.to_datetime(prices.index)
         prices = prices.sort_index()
         prices = prices.dropna(axis=1, how="all")
-        prices = _normalize_prices_to_gbp(prices, list(prices.columns))
+        prices = normalize_prices_to_gbp(prices, list(prices.columns))
         return prices
 
 
 def validate_and_clean_prices(prices: pd.DataFrame, threshold: float = 0.20) -> Tuple[pd.DataFrame, List[dict]]:
-    """Detect and fix single-day spikes: if |pct_change| and |pct_change_next| exceed threshold, replace with previous."""
+    """Detect and fix single-day spikes."""
     cleaned = prices.copy()
     report: List[dict] = []
     for t in cleaned.columns:
@@ -191,8 +182,7 @@ def validate_and_clean_prices(prices: pd.DataFrame, threshold: float = 0.20) -> 
         pct = s.pct_change()
         pct_next = s.pct_change(-1)
         spikes = (pct.abs() > threshold) & (pct_next.abs() > threshold)
-        spike_dates = s[spikes].index
-        for dt in spike_dates:
+        for dt in s[spikes].index:
             idx = s.index.get_loc(dt)
             if idx <= 0 or idx >= len(s) - 1:
                 continue
@@ -227,14 +217,13 @@ class BackfillEvent:
     context: str
 
 
-def _price_on_or_before(
+def price_on_or_before(
     prices: pd.DataFrame,
     ticker: str,
     dt: pd.Timestamp,
     backfills: List[BackfillEvent],
     context: str,
 ) -> float:
-    """Price on or before dt; if dt earlier than first price, backfill with first available and log."""
     s = prices[ticker].dropna()
     if s.empty:
         raise ValueError(f"No price data for {ticker}")
@@ -257,7 +246,6 @@ def _price_on_or_before(
 
 
 def calculate_volatility_asof(prices: pd.DataFrame, asof_dt: pd.Timestamp, window: int = 63) -> pd.Series:
-    """Rolling std of daily returns up to asof_dt."""
     asof_dt = pd.Timestamp(asof_dt)
     px = prices.loc[:asof_dt].copy()
     rets = px.pct_change()
@@ -273,8 +261,7 @@ def calculate_inverse_volatility_weights(volatilities: pd.Series) -> pd.Series:
     if valid.empty:
         raise ValueError("No valid volatilities to weight.")
     inv = 1.0 / valid
-    w = inv / inv.sum()
-    return w
+    return inv / inv.sum()
 
 
 def calculate_momentum_scores_asof(
@@ -283,35 +270,27 @@ def calculate_momentum_scores_asof(
     use_calendar_month_end: bool,
     backfills: List[BackfillEvent],
 ) -> pd.DataFrame:
-    """Momentum score = mean of trailing 1/3/6/12-month returns."""
     asof_dt = pd.Timestamp(asof_dt)
     tickers = list(prices.columns)
 
     if use_calendar_month_end:
-        # Build calendar month-ends; price sampled on or before these dates
         end_me = pd.Timestamp(asof_dt.date())
         month_ends = pd.date_range(end=end_me, periods=14, freq="ME")
         month_ends = [pd.Timestamp(d.date()) for d in month_ends]
         end_dt = month_ends[-1]
-        starts = {
-            "1M": month_ends[-2],
-            "3M": month_ends[-4],
-            "6M": month_ends[-7],
-            "12M": month_ends[-13],
-        }
+        starts = {"1M": month_ends[-2], "3M": month_ends[-4], "6M": month_ends[-7], "12M": month_ends[-13]}
         out = {}
         for label, start_dt in starts.items():
             rets = {}
             for t in tickers:
-                p_end = _price_on_or_before(prices, t, end_dt, backfills, context=f"Calendar {label} end")
-                p_start = _price_on_or_before(prices, t, start_dt, backfills, context=f"Calendar {label} start")
+                p_end = price_on_or_before(prices, t, end_dt, backfills, context=f"Calendar {label} end")
+                p_start = price_on_or_before(prices, t, start_dt, backfills, context=f"Calendar {label} start")
                 rets[t] = (p_end / p_start) - 1.0
             out[label] = pd.Series(rets)
         df = pd.DataFrame(out)
         df["Momentum Score"] = df.mean(axis=1)
         return df
 
-    # Trading-day approximations
     px = prices.loc[:asof_dt].copy()
     out = {}
     lookbacks = {"1M": 21, "3M": 63, "6M": 126, "12M": 252}
@@ -354,7 +333,7 @@ def compute_portfolio_value(holdings: Dict[str, int], prices_row: pd.Series, cas
     return float(total)
 
 
-def _target_integer_shares(top: List[str], weights: pd.Series, prices_row: pd.Series, total_value: float) -> Dict[str, int]:
+def target_integer_shares(top: List[str], weights: pd.Series, prices_row: pd.Series, total_value: float) -> Dict[str, int]:
     target: Dict[str, int] = {}
     for t in top:
         w = float(weights.get(t, 0.0))
@@ -371,14 +350,14 @@ def _target_integer_shares(top: List[str], weights: pd.Series, prices_row: pd.Se
 class TradeFill:
     date: pd.Timestamp
     ticker: str
-    side: str  # BUY or SELL
+    side: str
     shares: int
     price: float
     notional: float
     cost: float
 
 
-def _rebalance_to_target(
+def rebalance_to_target(
     exec_dt: pd.Timestamp,
     holdings: Dict[str, int],
     cash: float,
@@ -387,11 +366,10 @@ def _rebalance_to_target(
     include_costs: bool,
     cost_per_trade: float,
 ) -> Tuple[Dict[str, int], float, List[TradeFill]]:
-    """Execute rebalance at exec_dt close: sells then buys, with optional fixed cost per non-zero trade line item."""
     fills: List[TradeFill] = []
     tickers = sorted(set(holdings.keys()) | set(target.keys()))
 
-    # SELL first
+    # Sells first
     for t in tickers:
         cur = int(holdings.get(t, 0))
         tgt = int(target.get(t, 0))
@@ -412,7 +390,7 @@ def _rebalance_to_target(
             holdings[t] = tgt
         fills.append(TradeFill(exec_dt, t, "SELL", sh, px, notional, cost))
 
-    # BUY second
+    # Buys second
     for t in tickers:
         cur = int(holdings.get(t, 0))
         tgt = int(target.get(t, 0))
@@ -424,10 +402,8 @@ def _rebalance_to_target(
             continue
 
         cost = float(cost_per_trade) if include_costs else 0.0
-        # Pay cost only if we actually trade (and only once per ticker)
         cash_after_cost = cash - cost
         if cash_after_cost <= 0:
-            # Can't afford even the cost
             continue
 
         desired_sh = int(diff)
@@ -444,7 +420,7 @@ def _rebalance_to_target(
     return holdings, float(cash), fills
 
 
-def _compute_drawdown(equity: pd.Series) -> pd.Series:
+def compute_drawdown(equity: pd.Series) -> pd.Series:
     eq = equity.dropna()
     if eq.empty:
         return equity * np.nan
@@ -453,30 +429,19 @@ def _compute_drawdown(equity: pd.Series) -> pd.Series:
     return dd.reindex(equity.index)
 
 
-def _metrics_from_daily(
-    equity: pd.Series,
-    bench_equity: Optional[pd.Series] = None,
-    rf_daily: float = 0.0,
-) -> pd.DataFrame:
+def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = None) -> pd.DataFrame:
     eq = equity.dropna()
     if len(eq) < 2:
         return pd.DataFrame()
 
     rets = eq.pct_change().dropna()
-    n = len(rets)
-    ann_factor = 252.0
-    years = n / ann_factor
+    ann = 252.0
+    years = len(rets) / ann
 
-    start_v = float(eq.iloc[0])
-    end_v = float(eq.iloc[-1])
-    cagr = (end_v / start_v) ** (1.0 / years) - 1.0 if years > 0 else np.nan
-
-    vol = float(rets.std(ddof=1) * math.sqrt(ann_factor)) if rets.std(ddof=1) > 0 else np.nan
-    mean_excess = float((rets - rf_daily).mean())
-    sharpe = (mean_excess / rets.std(ddof=1)) * math.sqrt(ann_factor) if rets.std(ddof=1) > 0 else np.nan
-
-    dd = _compute_drawdown(eq)
-    max_dd = float(dd.min())
+    cagr = (float(eq.iloc[-1]) / float(eq.iloc[0])) ** (1.0 / years) - 1.0 if years > 0 else np.nan
+    vol = float(rets.std(ddof=1) * math.sqrt(ann)) if rets.std(ddof=1) > 0 else np.nan
+    sharpe = (float(rets.mean()) / float(rets.std(ddof=1))) * math.sqrt(ann) if rets.std(ddof=1) > 0 else np.nan
+    max_dd = float(compute_drawdown(eq).min())
 
     out = {
         "Annualized Return": cagr,
@@ -496,12 +461,23 @@ def _metrics_from_daily(
             rb = rb.reindex(idx)
             if len(idx) >= 10 and float(rb.var(ddof=1)) > 0:
                 beta = float(rs.cov(rb) / rb.var(ddof=1))
-                alpha_daily = float(rs.mean() - beta * rb.mean())
-                alpha_ann = alpha_daily * ann_factor
+                alpha_ann = float((rs.mean() - beta * rb.mean()) * ann)
                 out["Beta vs Benchmark"] = beta
                 out["Annualized Alpha"] = alpha_ann
 
     return pd.DataFrame([out])
+
+
+@dataclass
+class EquityIssue:
+    date: pd.Timestamp
+    portfolio_value_raw: float
+    portfolio_value_valued: float
+    previous_value: float
+    drop_pct: float
+    missing_prices: str
+    holdings_count: int
+    note: str
 
 
 @dataclass
@@ -515,39 +491,45 @@ class BacktestResult:
     metrics: pd.DataFrame
     spike_report: List[dict]
     backfills: List[BackfillEvent]
+    equity_issues: pd.DataFrame
+    first_exec_date: pd.Timestamp
 
 
 @st.cache_data(show_spinner=False)
 def run_backtest_cached(
     universe: Tuple[str, ...],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
+    start_iso: str,
+    end_iso: str,
     benchmark: str,
     use_calendar_month_end: bool,
     starting_capital: float,
     include_costs: bool,
     cost_per_trade: float,
     spike_threshold: float,
+    valuation_ffill_limit: int,
+    guardrail_enabled: bool,
+    guardrail_drop_pct: float,
 ) -> BacktestResult:
-    """Run backtest with daily equity + monthly rebalances. Cached per-process."""
+    start = pd.Timestamp(start_iso)
+    end = pd.Timestamp(end_iso)
 
     tickers = list(universe)
     if len(tickers) < 5:
         raise ValueError("Universe must contain at least 5 tickers.")
-
-    start = pd.Timestamp(start)
-    end = pd.Timestamp(end)
     if end <= start:
         raise ValueError("End date must be after start date.")
 
-    # Fetch buffer to support 12M momentum and the signal (t-1)
     buffer_days = 900
     fetch_start = start - pd.Timedelta(days=buffer_days)
     fetch_end = end + pd.Timedelta(days=10)
 
     tickers_all = tickers + ([benchmark] if benchmark and benchmark not in tickers else [])
 
-    raw = fetch_price_data_robust_cached(tuple(tickers_all), fetch_start, fetch_end)
+    raw = fetch_price_data_robust_cached(
+        tuple(tickers_all),
+        fetch_start.date().isoformat(),
+        fetch_end.date().isoformat(),
+    )
     cleaned, spike_report = validate_and_clean_prices(raw, threshold=spike_threshold)
 
     if benchmark:
@@ -563,57 +545,45 @@ def run_backtest_cached(
     if prices.empty:
         raise ValueError("No usable price data.")
 
-    # Build month-end trading dates based on available trading days in prices index
-    all_month_ends = _month_end_trading_days(prices.index)
-    # Ensure we have a signal month end prior to start period
-    # We will execute for month ends within [start, end]
+    all_month_ends = month_end_trading_days(prices.index)
     exec_month_ends = all_month_ends[(all_month_ends >= start) & (all_month_ends <= end)]
     if len(exec_month_ends) < 2:
         raise ValueError("Not enough month-end trading dates in selected range.")
 
-    # We need one prior month-end for the first signal
     first_exec = exec_month_ends[0]
     prior_month_ends = all_month_ends[all_month_ends < first_exec]
     if len(prior_month_ends) == 0:
         raise ValueError("Need at least one prior month-end trading day before start for look-ahead fix.")
-    first_signal = prior_month_ends[-1]
 
+    first_signal = prior_month_ends[-1]
     month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends)
 
-    # Init portfolio (all cash until first execution)
+    prices_val = prices.ffill(limit=int(valuation_ffill_limit)) if valuation_ffill_limit > 0 else prices.copy()
+
     holdings: Dict[str, int] = {}
     cash = float(starting_capital)
     backfills: List[BackfillEvent] = []
 
-    # Trade logs / rebalance summaries
     trade_fills: List[TradeFill] = []
     reb_rows: List[dict] = []
 
-    # Daily equity curve
     equity = pd.Series(index=prices.index, dtype=float)
+    issues: List[EquityIssue] = []
+    prev_equity: Optional[float] = None
 
-    # Benchmark daily equity
     if bench_px is not None:
         bench_px = bench_px.dropna().sort_index()
 
-    # Iterate executions: exec at month_ends[i] for i>=1; signal at month_ends[i-1]
     for i in range(1, len(month_ends)):
         signal_dt = pd.Timestamp(month_ends[i - 1])
         exec_dt = pd.Timestamp(month_ends[i])
 
-        # Compute signal using data up to signal_dt
-        mom_df = calculate_momentum_scores_asof(
-            prices=prices,
-            asof_dt=signal_dt,
-            use_calendar_month_end=use_calendar_month_end,
-            backfills=backfills,
-        )
-        vol = calculate_volatility_asof(prices, asof_dt=signal_dt, window=63)
+        mom_df = calculate_momentum_scores_asof(prices, signal_dt, use_calendar_month_end, backfills)
+        vol = calculate_volatility_asof(prices, signal_dt, window=63)
         valid_mom = mom_df["Momentum Score"].dropna()
 
-        # Use execution prices at exec_dt
-        px_row = prices.loc[:exec_dt].iloc[-1]
-        port_val_before = compute_portfolio_value(holdings, px_row, cash)
+        px_row_exec = prices.loc[:exec_dt].iloc[-1]
+        port_val_before = compute_portfolio_value(holdings, px_row_exec, cash)
 
         if len(valid_mom) < 5:
             reb_rows.append(
@@ -631,24 +601,14 @@ def run_backtest_cached(
         else:
             top5 = valid_mom.nlargest(5).index.tolist()
             w = calculate_inverse_volatility_weights(vol.reindex(top5))
-            target = _target_integer_shares(top5, w, px_row, port_val_before)
+            target = target_integer_shares(top5, w, px_row_exec, port_val_before)
 
-            # Execute rebalance
-            holdings, cash, fills = _rebalance_to_target(
-                exec_dt=exec_dt,
-                holdings=holdings,
-                cash=cash,
-                target=target,
-                px_row=px_row,
-                include_costs=include_costs,
-                cost_per_trade=cost_per_trade,
-            )
+            holdings, cash, fills = rebalance_to_target(exec_dt, holdings, cash, target, px_row_exec, include_costs, cost_per_trade)
             trade_fills.extend(fills)
 
-            # Turnover
             traded_notional = sum(f.notional for f in fills)
             turnover = traded_notional / port_val_before if port_val_before > 0 else np.nan
-            port_val_after = compute_portfolio_value(holdings, px_row, cash)
+            port_val_after = compute_portfolio_value(holdings, px_row_exec, cash)
 
             reb_rows.append(
                 {
@@ -663,23 +623,44 @@ def run_backtest_cached(
                 }
             )
 
-        # Fill daily equity from this exec_dt until next exec_dt (exclusive)
         next_exec = pd.Timestamp(month_ends[i + 1]) if (i + 1) < len(month_ends) else None
-        if next_exec is None:
-            seg_end = prices.index.max() + pd.Timedelta(days=1)
-        else:
-            seg_end = next_exec
-
+        seg_end = next_exec if next_exec is not None else (prices.index.max() + pd.Timedelta(days=1))
         seg_idx = prices.index[(prices.index >= exec_dt) & (prices.index < seg_end)]
         if len(seg_idx) == 0:
             continue
 
-        # Mark-to-market for each day
         for dt in seg_idx:
-            px_day = prices.loc[dt]
-            equity.loc[dt] = compute_portfolio_value(holdings, px_day, cash)
+            px_raw = prices.loc[dt]
+            px_val = prices_val.loc[dt]
 
-    # Trim equity to requested window (from first exec date to end)
+            eq_raw = compute_portfolio_value(holdings, px_raw, cash)
+            eq_val = compute_portfolio_value(holdings, px_val, cash)
+
+            missing = [t for t in holdings.keys() if pd.isna(px_raw.get(t, np.nan))]
+
+            eq_used = eq_val
+
+            if prev_equity is not None and prev_equity > 0:
+                drop_pct = 1.0 - (eq_used / prev_equity)
+
+                if guardrail_enabled and (drop_pct >= guardrail_drop_pct) and (len(missing) > 0):
+                    issues.append(
+                        EquityIssue(
+                            date=pd.Timestamp(dt),
+                            portfolio_value_raw=float(eq_raw),
+                            portfolio_value_valued=float(eq_val),
+                            previous_value=float(prev_equity),
+                            drop_pct=float(drop_pct),
+                            missing_prices=",".join(sorted(missing))[:500],
+                            holdings_count=len(holdings),
+                            note="Guardrail applied: large drop with missing prices; kept previous equity.",
+                        )
+                    )
+                    eq_used = float(prev_equity)
+
+            equity.loc[dt] = float(eq_used)
+            prev_equity = float(eq_used)
+
     first_exec_dt = exec_month_ends[0]
     equity = equity.loc[(equity.index >= first_exec_dt) & (equity.index <= exec_month_ends[-1])].dropna()
 
@@ -689,27 +670,32 @@ def run_backtest_cached(
         if not b.empty:
             bench_equity = pd.Series(index=b.index, data=(starting_capital * (b / float(b.iloc[0]))), dtype=float)
 
-    dd = _compute_drawdown(equity)
-    dd_b = _compute_drawdown(bench_equity) if bench_equity is not None else None
+    dd = compute_drawdown(equity)
+    dd_b = compute_drawdown(bench_equity) if bench_equity is not None else None
 
-    metrics = _metrics_from_daily(equity, bench_equity)
+    metrics = metrics_from_daily(equity, bench_equity)
 
     trades_df = pd.DataFrame(
         [
-            {
-                "Date": f.date,
-                "Ticker": f.ticker,
-                "Side": f.side,
-                "Shares": f.shares,
-                "Price": f.price,
-                "Notional": f.notional,
-                "Cost": f.cost,
-            }
+            {"Date": f.date, "Ticker": f.ticker, "Side": f.side, "Shares": f.shares, "Price": f.price, "Notional": f.notional, "Cost": f.cost}
             for f in trade_fills
         ]
     )
 
     rebalances_df = pd.DataFrame(reb_rows)
+
+    issues_df = pd.DataFrame([i.__dict__ for i in issues]) if issues else pd.DataFrame(
+        columns=[
+            "date",
+            "portfolio_value_raw",
+            "portfolio_value_valued",
+            "previous_value",
+            "drop_pct",
+            "missing_prices",
+            "holdings_count",
+            "note",
+        ]
+    )
 
     return BacktestResult(
         equity_daily=equity,
@@ -721,6 +707,8 @@ def run_backtest_cached(
         metrics=metrics,
         spike_report=spike_report,
         backfills=backfills,
+        equity_issues=issues_df,
+        first_exec_date=first_exec_dt,
     )
 
 
@@ -765,10 +753,8 @@ def make_drawdown_fig(dd: pd.Series, dd_bench: Optional[pd.Series]) -> go.Figure
 # Excel export
 # =========================
 
-def _try_plotly_png(fig: go.Figure, scale: float = 2.0) -> Optional[bytes]:
-    """Return PNG bytes for a Plotly fig if Kaleido is available."""
+def try_plotly_png(fig: go.Figure, scale: float = 2.0) -> Optional[bytes]:
     try:
-        # Plotly handles kaleido internally
         return fig.to_image(format="png", scale=scale)
     except Exception:
         return None
@@ -779,7 +765,6 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure,
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         wb = writer.book
 
-        # Sheets
         metrics = res.metrics.copy()
         if not metrics.empty:
             metrics.insert(0, "Benchmark", benchmark)
@@ -797,16 +782,15 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure,
 
         res.rebalances.to_excel(writer, sheet_name="Rebalances", index=False)
         res.trades.to_excel(writer, sheet_name="Trades", index=False)
+        res.equity_issues.to_excel(writer, sheet_name="EquityIssues", index=False)
 
-        # Notes
         ws_notes = wb.add_worksheet("Notes")
         ws_notes.write(0, 0, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         ws_notes.write(1, 0, "Cash earns 0%.")
         ws_notes.write(2, 0, "Signals computed as-of prior month-end trading day; trades executed at month-end close.")
 
-        # Embed images if possible
-        png1 = _try_plotly_png(eq_fig)
-        png2 = _try_plotly_png(dd_fig)
+        png1 = try_plotly_png(eq_fig)
+        png2 = try_plotly_png(dd_fig)
         if png1 is not None or png2 is not None:
             ws_ch = wb.add_worksheet("Charts")
             row = 0
@@ -825,7 +809,7 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure,
 # Streamlit App
 # =========================
 
-def _default_universe() -> str:
+def default_universe() -> str:
     return "VUSA.L,EQQQ.L,VUKE.L,VERX.L,VAPX.L,VJPN.L,VFEM.L,IUKP.L,IGLS.L,IGLT.L,SLXX.L,SGLN.L"
 
 
@@ -833,19 +817,32 @@ def app():
     st.set_page_config(page_title="Rising Assets Backtester", layout="wide")
     st.title("Rising Assets — Streamlit Backtester")
 
+    today = date.today()
+
     with st.sidebar:
         st.header("Inputs")
-        universe_text = st.text_area("Universe (comma/newline separated)", value=_default_universe(), height=120)
+        universe_text = st.text_area("Universe (comma/newline separated)", value=default_universe(), height=120)
         benchmark = st.text_input("Benchmark ticker", value="^GSPC")
 
         col1, col2 = st.columns(2)
         with col1:
-            start = st.date_input("Start (approx)", value=date(2004, 11, 30))
+            start = st.date_input(
+                "Start (approx)",
+                value=date(2004, 11, 30),
+                min_value=date(1990, 1, 1),
+                max_value=today,
+                key="start_date",
+            )
         with col2:
-            end = st.date_input("End (approx)", value=date(2018, 12, 31))
+            end = st.date_input(
+                "End (approx)",
+                value=today,
+                min_value=date(1990, 1, 1),
+                max_value=today,
+                key="end_date",
+            )
 
         use_calendar_month_end = st.checkbox("Calendar month-end momentum sampling", value=False)
-
         starting_capital = st.number_input("Starting capital", value=100000.0, step=1000.0)
 
         st.subheader("Costs")
@@ -853,7 +850,32 @@ def app():
         cost_per_trade = st.number_input("Cost per trade (£ per ticker traded)", value=5.0, step=1.0)
 
         st.subheader("Data quality")
-        spike_threshold = st.slider("Spike threshold (abs daily change)", min_value=0.05, max_value=0.80, value=0.20, step=0.05)
+        spike_threshold = st.slider(
+            "Spike threshold (abs daily change)",
+            min_value=0.05,
+            max_value=0.80,
+            value=0.20,
+            step=0.05,
+        )
+
+        st.subheader("Valuation guardrail")
+        valuation_ffill_limit = st.number_input(
+            "Forward-fill limit for valuation (trading days)",
+            min_value=0,
+            max_value=20,
+            value=5,
+            step=1,
+            help="Used only to mark-to-market holdings on days where Yahoo returns missing prices.",
+        )
+        guardrail_enabled = st.checkbox("Enable guardrail", value=True)
+        guardrail_drop_pct = st.slider(
+            "Guardrail drop threshold (fraction)",
+            min_value=0.10,
+            max_value=0.90,
+            value=0.50,
+            step=0.05,
+            help="If equity drops by >= this fraction in one day AND some held tickers have missing prices, the equity is held flat and logged.",
+        )
 
         run_btn = st.button("Run backtest", type="primary")
 
@@ -863,27 +885,31 @@ def app():
         if len(universe) < 5:
             st.error("Universe must contain at least 5 tickers.")
             st.stop()
+        if end <= start:
+            st.error("End date must be after start date.")
+            st.stop()
 
-        start_ts = pd.Timestamp(start)
-        end_ts = pd.Timestamp(end)
+        start_iso = pd.Timestamp(start).date().isoformat()
+        end_iso = pd.Timestamp(end).date().isoformat()
 
         with st.spinner("Running backtest..."):
             res = run_backtest_cached(
                 universe=universe,
-                start=start_ts,
-                end=end_ts,
+                start_iso=start_iso,
+                end_iso=end_iso,
                 benchmark=benchmark.strip(),
                 use_calendar_month_end=use_calendar_month_end,
                 starting_capital=float(starting_capital),
                 include_costs=bool(include_costs),
                 cost_per_trade=float(cost_per_trade),
                 spike_threshold=float(spike_threshold),
+                valuation_ffill_limit=int(valuation_ffill_limit),
+                guardrail_enabled=bool(guardrail_enabled),
+                guardrail_drop_pct=float(guardrail_drop_pct),
             )
 
-        if res.metrics is None or res.metrics.empty:
-            st.warning("Not enough data to compute metrics.")
+        st.caption(f"Requested window: {start_iso} to {end_iso} | First execution date: {res.first_exec_date.date().isoformat()}")
 
-        # Charts
         eq_fig = make_equity_fig(res.equity_daily, res.equity_benchmark_daily)
         dd_fig = make_drawdown_fig(res.drawdown_daily, res.drawdown_benchmark_daily)
 
@@ -893,26 +919,21 @@ def app():
         with c2:
             st.plotly_chart(dd_fig, use_container_width=True)
 
-        # Metrics
         st.subheader("Metrics (daily returns)")
         if res.metrics is not None and not res.metrics.empty:
-            # Format as percentages where appropriate
-            m = res.metrics.copy()
-            for col in ["Annualized Return", "Annualized Volatility", "Maximum Drawdown", "Annualized Alpha"]:
-                if col in m.columns:
-                    m[col] = m[col].astype(float)
-            st.dataframe(m, use_container_width=True)
+            st.dataframe(res.metrics, use_container_width=True)
         else:
             st.info("Metrics table is empty.")
 
-        # Trades / Rebalances
         st.subheader("Rebalances")
         st.dataframe(res.rebalances, use_container_width=True)
 
         st.subheader("Trades")
         st.dataframe(res.trades, use_container_width=True)
 
-        # Excel download
+        st.subheader("Equity issues (guardrail log)")
+        st.dataframe(res.equity_issues, use_container_width=True)
+
         excel_bytes = build_excel_bytes(res, eq_fig, dd_fig, benchmark)
         filename = f"RisingAssets_Backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         st.download_button(
@@ -922,7 +943,6 @@ def app():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # Data quality notes
         with st.expander("Data quality logs"):
             st.write(f"Price spikes corrected: {len(res.spike_report)}")
             if res.spike_report:
