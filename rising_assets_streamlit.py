@@ -950,7 +950,15 @@ def app():
 
         st.subheader("Metrics (daily returns)")
         if res.metrics is not None and not res.metrics.empty:
-            st.dataframe(res.metrics, use_container_width=True)
+            m = res.metrics.copy()
+
+            # Convert selected columns from fraction to percentage with 2dp
+            pct_cols = ["Annualized Return", "Annualized Volatility", "Maximum Drawdown", "Annualized Alpha"]
+            for col in pct_cols:
+                if col in m.columns:
+                    m[col] = (m[col].astype(float) * 100).map("{:.2f}%".format)
+
+            st.dataframe(m, use_container_width=True)
         else:
             st.info("Metrics table is empty.")
 
