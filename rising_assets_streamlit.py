@@ -1,4 +1,4 @@
-"""Rising Assets Strategy — Streamlit Backtester (v5.1)
+"""Rising Assets Strategy — Streamlit Backtester (v5.2)
 
 Fixes vs v5
 - Adds guardrail + valuation forward-fill to prevent spurious near-zero equity caused by missing prices.
@@ -718,9 +718,25 @@ def run_backtest_cached(
 
 def make_equity_fig(eq: pd.Series, bench: Optional[pd.Series]) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="Strategy", line=dict(width=2)))
+    # Strategy = blue
+    fig.add_trace(
+        go.Scatter(
+            x=eq.index,
+            y=eq.values,
+            name="Strategy",
+            line=dict(width=2, color="#1f77b4"),
+        )
+    )
     if bench is not None and not bench.empty:
-        fig.add_trace(go.Scatter(x=bench.index, y=bench.values, name="Benchmark", line=dict(width=2)))
+        # Benchmark = red
+        fig.add_trace(
+            go.Scatter(
+                x=bench.index,
+                y=bench.values,
+                name="Benchmark",
+                line=dict(width=2, color="#d62728"),
+            )
+        )
     fig.update_layout(
         height=420,
         margin=dict(l=10, r=10, t=40, b=10),
@@ -731,12 +747,25 @@ def make_equity_fig(eq: pd.Series, bench: Optional[pd.Series]) -> go.Figure:
     )
     return fig
 
-
 def make_drawdown_fig(dd: pd.Series, dd_bench: Optional[pd.Series]) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dd.index, y=dd.values * 100.0, name="Strategy", line=dict(width=2)))
+    fig.add_trace(
+        go.Scatter(
+            x=dd.index,
+            y=dd.values * 100.0,
+            name="Strategy",
+            line=dict(width=2, color="#1f77b4"),
+        )
+    )
     if dd_bench is not None and not dd_bench.empty:
-        fig.add_trace(go.Scatter(x=dd_bench.index, y=dd_bench.values * 100.0, name="Benchmark", line=dict(width=2)))
+        fig.add_trace(
+            go.Scatter(
+                x=dd_bench.index,
+                y=dd_bench.values * 100.0,
+                name="Benchmark",
+                line=dict(width=2, color="#d62728"),
+            )
+        )
     fig.update_layout(
         height=320,
         margin=dict(l=10, r=10, t=40, b=10),
@@ -815,7 +844,7 @@ def default_universe() -> str:
 
 def app():
     st.set_page_config(page_title="Rising Assets Backtester", layout="wide")
-    st.title("Rising Assets — Streamlit Backtester")
+    st.title("Rising Assets — Streamlit Backtester 5.2")
 
     today = date.today()
 
