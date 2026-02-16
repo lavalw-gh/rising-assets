@@ -1,4 +1,8 @@
-"""Rising Assets Strategy — Streamlit Backtester (v5.2)
+"""Rising Assets Strategy — Streamlit Backtester (v5.3)
+
+Changes in v5.3:
+- Adds "Use max dates" checkbox to automatically determine the maximum common date range
+  across all tickers in the universe and benchmark.
 
 Fixes vs v5
 - Adds guardrail + valuation forward-fill to prevent spurious near-zero equity caused by missing prices.
@@ -7,15 +11,16 @@ Fixes vs v5
 
 Core model
 - Monthly rebalance with look-ahead fix:
-    * Signal computed as-of prior month-end trading day (t-1)
-    * Trades executed at month-end trading day close (t)
+  * Signal computed as-of prior month-end trading day (t-1)
+  * Trades executed at month-end trading day close (t)
 - Uses adjusted closes from Yahoo Finance via yfinance (auto_adjust=True).
 - Cash earns 0%.
 
 Dependencies
-    pip install streamlit yfinance pandas numpy xlsxwriter plotly
+pip install streamlit yfinance pandas numpy xlsxwriter plotly
+
 Optional for embedding PNG charts into Excel:
-    pip install kaleido
+pip install kaleido
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from __future__ import annotations
 import io
 import math
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,7 +36,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-
 
 # =========================
 # Utilities
@@ -54,7 +58,6 @@ def parse_universe(text: str) -> List[str]:
             seen.add(t)
     return out
 
-
 def month_end_trading_days(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Return the last trading day for each (year, month) present in index."""
     if not isinstance(index, pd.DatetimeIndex):
@@ -66,6 +69,71 @@ def month_end_trading_days(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     month_last = s.groupby(idx.to_period("M")).max().sort_values()
     return pd.DatetimeIndex(month_last.values)
 
+# =========================
+# Max date range determination
+# =========================
+
+def find_max_common_start_date(symbols: List[str]) -> Tuple[date | None, str | None]:
+    """
+    Fetch maximum available history for all symbols and find the latest
+    first-valid-date (so all symbols have data from that point forward).
+    Returns (start_date, limiting_symbol)
+    """
+    if not symbols:
+        return None, None
+    
+    # Fetch from a very early date to get all available history
+    early_start = date(1990, 1, 1)
+    today_date = date.today()
+    end_plus = today_date + timedelta(days=1)
+    
+    try:
+        data = yf.download(
+            symbols,
+            start=early_start,
+            end=end_plus,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker" if len(symbols) > 1 else None,
+        )
+        
+        if data is None or len(data) == 0:
+            return None, None
+        
+        # Extract Close prices
+        prices = pd.DataFrame()
+        if len(symbols) == 1:
+            if "Close" not in data.columns:
+                return None, None
+            prices[symbols[0]] = data["Close"].copy()
+        else:
+            for t in symbols:
+                if hasattr(data.columns, "levels") and t in data.columns.levels[0]:
+                    if "Close" in data[t].columns:
+                        prices[t] = data[t]["Close"].copy()
+        
+        if prices.empty:
+            return None, None
+        
+        # Find first valid date for each symbol
+        first_dates = {}
+        for sym in symbols:
+            if sym in prices.columns:
+                first_valid = prices[sym].first_valid_index()
+                if first_valid is not None:
+                    first_dates[sym] = pd.to_datetime(first_valid).date()
+        
+        if not first_dates:
+            return None, None
+        
+        # The max (latest) first date is our common start
+        limiting_symbol = max(first_dates, key=first_dates.get)
+        common_start = first_dates[limiting_symbol]
+        
+        return common_start, limiting_symbol
+        
+    except Exception:
+        return None, None
 
 # =========================
 # Data fetch + cleaning
@@ -99,13 +167,11 @@ def normalize_prices_to_gbp(prices: pd.DataFrame, tickers: List[str]) -> pd.Data
             pass
     return normalized
 
-
 @st.cache_data(show_spinner=False)
 def fetch_price_data_robust_cached(
     tickers: Tuple[str, ...], start_iso: str, end_iso: str
 ) -> pd.DataFrame:
     """Fetch adjusted close prices (Close) using yfinance, with fallback downloads.
-
     Cached in-memory per Streamlit process.
     Uses ISO date strings for stable Streamlit caching keys.
     """
@@ -126,6 +192,7 @@ def fetch_price_data_robust_cached(
             group_by="ticker" if len(tlist) > 1 else None,
             threads=True,
         )
+
         if data is None or len(data) == 0:
             raise ValueError("No data returned from Yahoo Finance.")
 
@@ -143,8 +210,10 @@ def fetch_price_data_robust_cached(
         prices.index = pd.to_datetime(prices.index)
         prices = prices.sort_index()
         prices = prices.dropna(axis=1, how="all")
+
         if prices.shape[1] == 0:
             raise ValueError("Could not extract price data from any ticker.")
+
         prices = normalize_prices_to_gbp(prices, list(prices.columns))
         return prices
 
@@ -161,15 +230,16 @@ def fetch_price_data_robust_cached(
             )
             if d is not None and len(d) > 0 and "Close" in d.columns:
                 prices_dict[t] = d["Close"].copy()
+
         if not prices_dict:
             raise ValueError("No tickers successfully downloaded.")
+
         prices = pd.DataFrame(prices_dict)
         prices.index = pd.to_datetime(prices.index)
         prices = prices.sort_index()
         prices = prices.dropna(axis=1, how="all")
         prices = normalize_prices_to_gbp(prices, list(prices.columns))
         return prices
-
 
 def validate_and_clean_prices(prices: pd.DataFrame, threshold: float = 0.20) -> Tuple[pd.DataFrame, List[dict]]:
     """Detect and fix single-day spikes."""
@@ -203,7 +273,6 @@ def validate_and_clean_prices(prices: pd.DataFrame, threshold: float = 0.20) -> 
             )
     return cleaned, report
 
-
 # =========================
 # Strategy calculations
 # =========================
@@ -215,7 +284,6 @@ class BackfillEvent:
     used_date: pd.Timestamp
     used_price: float
     context: str
-
 
 def price_on_or_before(
     prices: pd.DataFrame,
@@ -244,7 +312,6 @@ def price_on_or_before(
         return first_px
     return float(eligible.iloc[-1])
 
-
 def calculate_volatility_asof(prices: pd.DataFrame, asof_dt: pd.Timestamp, window: int = 63) -> pd.Series:
     asof_dt = pd.Timestamp(asof_dt)
     px = prices.loc[:asof_dt].copy()
@@ -255,14 +322,12 @@ def calculate_volatility_asof(prices: pd.DataFrame, asof_dt: pd.Timestamp, windo
         vol = rets.std()
     return vol
 
-
 def calculate_inverse_volatility_weights(volatilities: pd.Series) -> pd.Series:
     valid = volatilities[(volatilities > 0) & volatilities.notna()].copy()
     if valid.empty:
         raise ValueError("No valid volatilities to weight.")
     inv = 1.0 / valid
     return inv / inv.sum()
-
 
 def calculate_momentum_scores_asof(
     prices: pd.DataFrame,
@@ -279,6 +344,7 @@ def calculate_momentum_scores_asof(
         month_ends = [pd.Timestamp(d.date()) for d in month_ends]
         end_dt = month_ends[-1]
         starts = {"1M": month_ends[-2], "3M": month_ends[-4], "6M": month_ends[-7], "12M": month_ends[-13]}
+
         out = {}
         for label, start_dt in starts.items():
             rets = {}
@@ -287,6 +353,7 @@ def calculate_momentum_scores_asof(
                 p_start = price_on_or_before(prices, t, start_dt, backfills, context=f"Calendar {label} start")
                 rets[t] = (p_end / p_start) - 1.0
             out[label] = pd.Series(rets)
+
         df = pd.DataFrame(out)
         df["Momentum Score"] = df.mean(axis=1)
         return df
@@ -294,10 +361,12 @@ def calculate_momentum_scores_asof(
     px = prices.loc[:asof_dt].copy()
     out = {}
     lookbacks = {"1M": 21, "3M": 63, "6M": 126, "12M": 252}
+
     for label, days in lookbacks.items():
         if len(px) == 0:
             out[label] = pd.Series(index=tickers, dtype=float)
             continue
+
         if len(px) > days:
             p_end = px.iloc[-1]
             p_start = px.iloc[-days]
@@ -316,10 +385,10 @@ def calculate_momentum_scores_asof(
                     )
                 )
             out[label] = (p_end / p_start) - 1.0
+
     df = pd.DataFrame(out)
     df["Momentum Score"] = df.mean(axis=1)
     return df
-
 
 # =========================
 # Portfolio + backtest
@@ -331,7 +400,6 @@ def compute_portfolio_value(holdings: Dict[str, int], prices_row: pd.Series, cas
         if t in prices_row.index and pd.notna(prices_row[t]):
             total += int(sh) * float(prices_row[t])
     return float(total)
-
 
 def target_integer_shares(top: List[str], weights: pd.Series, prices_row: pd.Series, total_value: float) -> Dict[str, int]:
     target: Dict[str, int] = {}
@@ -345,7 +413,6 @@ def target_integer_shares(top: List[str], weights: pd.Series, prices_row: pd.Ser
         target[t] = max(sh, 0)
     return target
 
-
 @dataclass
 class TradeFill:
     date: pd.Timestamp
@@ -355,7 +422,6 @@ class TradeFill:
     price: float
     notional: float
     cost: float
-
 
 def rebalance_to_target(
     exec_dt: pd.Timestamp,
@@ -400,25 +466,21 @@ def rebalance_to_target(
         px = float(px_row.get(t, np.nan))
         if not (px > 0):
             continue
-
         cost = float(cost_per_trade) if include_costs else 0.0
         cash_after_cost = cash - cost
         if cash_after_cost <= 0:
             continue
-
         desired_sh = int(diff)
         max_affordable = int(math.floor(cash_after_cost / px))
         buy_sh = min(desired_sh, max_affordable)
         if buy_sh <= 0:
             continue
-
         notional = buy_sh * px
         cash = cash_after_cost - notional
         holdings[t] = cur + buy_sh
         fills.append(TradeFill(exec_dt, t, "BUY", buy_sh, px, notional, cost))
 
     return holdings, float(cash), fills
-
 
 def compute_drawdown(equity: pd.Series) -> pd.Series:
     eq = equity.dropna()
@@ -427,7 +489,6 @@ def compute_drawdown(equity: pd.Series) -> pd.Series:
     peak = eq.cummax()
     dd = (eq / peak) - 1.0
     return dd.reindex(equity.index)
-
 
 def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = None) -> pd.DataFrame:
     eq = equity.dropna()
@@ -467,7 +528,6 @@ def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = No
 
     return pd.DataFrame([out])
 
-
 @dataclass
 class EquityIssue:
     date: pd.Timestamp
@@ -478,7 +538,6 @@ class EquityIssue:
     missing_prices: str
     holdings_count: int
     note: str
-
 
 @dataclass
 class BacktestResult:
@@ -493,7 +552,7 @@ class BacktestResult:
     backfills: List[BackfillEvent]
     equity_issues: pd.DataFrame
     first_exec_date: pd.Timestamp
-
+    max_mode_info: Tuple[bool, str | None, date | None]  # (is_max_mode, limiting_symbol, start_date)
 
 @st.cache_data(show_spinner=False)
 def run_backtest_cached(
@@ -509,6 +568,7 @@ def run_backtest_cached(
     valuation_ffill_limit: int,
     guardrail_enabled: bool,
     guardrail_drop_pct: float,
+    max_mode_info: Tuple[bool, str | None, str | None],  # (is_max_mode, limiting_symbol, start_date_iso)
 ) -> BacktestResult:
     start = pd.Timestamp(start_iso)
     end = pd.Timestamp(end_iso)
@@ -516,6 +576,7 @@ def run_backtest_cached(
     tickers = list(universe)
     if len(tickers) < 5:
         raise ValueError("Universe must contain at least 5 tickers.")
+
     if end <= start:
         raise ValueError("End date must be after start date.")
 
@@ -530,6 +591,7 @@ def run_backtest_cached(
         fetch_start.date().isoformat(),
         fetch_end.date().isoformat(),
     )
+
     cleaned, spike_report = validate_and_clean_prices(raw, threshold=spike_threshold)
 
     if benchmark:
@@ -547,11 +609,13 @@ def run_backtest_cached(
 
     all_month_ends = month_end_trading_days(prices.index)
     exec_month_ends = all_month_ends[(all_month_ends >= start) & (all_month_ends <= end)]
+
     if len(exec_month_ends) < 2:
         raise ValueError("Not enough month-end trading dates in selected range.")
 
     first_exec = exec_month_ends[0]
     prior_month_ends = all_month_ends[all_month_ends < first_exec]
+
     if len(prior_month_ends) == 0:
         raise ValueError("Need at least one prior month-end trading day before start for look-ahead fix.")
 
@@ -563,10 +627,8 @@ def run_backtest_cached(
     holdings: Dict[str, int] = {}
     cash = float(starting_capital)
     backfills: List[BackfillEvent] = []
-
     trade_fills: List[TradeFill] = []
     reb_rows: List[dict] = []
-
     equity = pd.Series(index=prices.index, dtype=float)
     issues: List[EquityIssue] = []
     prev_equity: Optional[float] = None
@@ -581,8 +643,8 @@ def run_backtest_cached(
         mom_df = calculate_momentum_scores_asof(prices, signal_dt, use_calendar_month_end, backfills)
         vol = calculate_volatility_asof(prices, signal_dt, window=63)
         valid_mom = mom_df["Momentum Score"].dropna()
-
         px_row_exec = prices.loc[:exec_dt].iloc[-1]
+
         port_val_before = compute_portfolio_value(holdings, px_row_exec, cash)
 
         if len(valid_mom) < 5:
@@ -602,7 +664,6 @@ def run_backtest_cached(
             top5 = valid_mom.nlargest(5).index.tolist()
             w = calculate_inverse_volatility_weights(vol.reindex(top5))
             target = target_integer_shares(top5, w, px_row_exec, port_val_before)
-
             holdings, cash, fills = rebalance_to_target(exec_dt, holdings, cash, target, px_row_exec, include_costs, cost_per_trade)
             trade_fills.extend(fills)
 
@@ -626,6 +687,7 @@ def run_backtest_cached(
         next_exec = pd.Timestamp(month_ends[i + 1]) if (i + 1) < len(month_ends) else None
         seg_end = next_exec if next_exec is not None else (prices.index.max() + pd.Timedelta(days=1))
         seg_idx = prices.index[(prices.index >= exec_dt) & (prices.index < seg_end)]
+
         if len(seg_idx) == 0:
             continue
 
@@ -637,12 +699,10 @@ def run_backtest_cached(
             eq_val = compute_portfolio_value(holdings, px_val, cash)
 
             missing = [t for t in holdings.keys() if pd.isna(px_raw.get(t, np.nan))]
-
             eq_used = eq_val
 
             if prev_equity is not None and prev_equity > 0:
                 drop_pct = 1.0 - (eq_used / prev_equity)
-
                 if guardrail_enabled and (drop_pct >= guardrail_drop_pct) and (len(missing) > 0):
                     issues.append(
                         EquityIssue(
@@ -697,6 +757,10 @@ def run_backtest_cached(
         ]
     )
 
+    # Extract max_mode_info for result
+    is_max_mode, limiting_symbol, start_date_iso = max_mode_info
+    start_date_for_result = date.fromisoformat(start_date_iso) if start_date_iso else None
+
     return BacktestResult(
         equity_daily=equity,
         equity_benchmark_daily=bench_equity,
@@ -709,8 +773,8 @@ def run_backtest_cached(
         backfills=backfills,
         equity_issues=issues_df,
         first_exec_date=first_exec_dt,
+        max_mode_info=(is_max_mode, limiting_symbol, start_date_for_result),
     )
-
 
 # =========================
 # Charts
@@ -777,7 +841,6 @@ def make_drawdown_fig(dd: pd.Series, dd_bench: Optional[pd.Series]) -> go.Figure
     fig.update_yaxes(ticksuffix="%")
     return fig
 
-
 # =========================
 # Excel export
 # =========================
@@ -787,7 +850,6 @@ def try_plotly_png(fig: go.Figure, scale: float = 2.0) -> Optional[bytes]:
         return fig.to_image(format="png", scale=scale)
     except Exception:
         return None
-
 
 def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure, benchmark: str) -> bytes:
     buf = io.BytesIO()
@@ -817,9 +879,15 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure,
         ws_notes.write(0, 0, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         ws_notes.write(1, 0, "Cash earns 0%.")
         ws_notes.write(2, 0, "Signals computed as-of prior month-end trading day; trades executed at month-end close.")
+        
+        # Add max mode note if applicable
+        is_max_mode, limiting_symbol, start_date_used = res.max_mode_info
+        if is_max_mode and limiting_symbol and start_date_used:
+            ws_notes.write(3, 0, f"Max date mode: earliest common start date {start_date_used.strftime('%Y-%m-%d')} (limited by {limiting_symbol}).")
 
         png1 = try_plotly_png(eq_fig)
         png2 = try_plotly_png(dd_fig)
+
         if png1 is not None or png2 is not None:
             ws_ch = wb.add_worksheet("Charts")
             row = 0
@@ -829,10 +897,9 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure,
             if png2 is not None:
                 ws_ch.insert_image(row, 0, "drawdown.png", {"image_data": io.BytesIO(png2)})
         else:
-            ws_notes.write(4, 0, "Chart images not embedded (install 'kaleido' to enable Plotly PNG export).")
+            ws_notes.write(5, 0, "Chart images not embedded (install 'kaleido' to enable Plotly PNG export).")
 
     return buf.getvalue()
-
 
 # =========================
 # Streamlit App
@@ -841,37 +908,45 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure,
 def default_universe() -> str:
     return "VUSA.L,EQQQ.L,VUKE.L,VERX.L,VAPX.L,VJPN.L,VFEM.L,IUKP.L,IGLS.L,IGLT.L,SLXX.L,SGLN.L"
 
-
 def app():
     st.set_page_config(page_title="Rising Assets Backtester", layout="wide")
-    st.title("Rising Assets — Streamlit Backtester 5.2")
+    st.title("Rising Assets — Streamlit Backtester 5.3")
 
-    today = date.today()
+    today_date = date.today()
+    yesterday = today_date - timedelta(days=1)
 
     with st.sidebar:
         st.header("Inputs")
+
         universe_text = st.text_area("Universe (comma/newline separated)", value=default_universe(), height=120)
         benchmark = st.text_input("Benchmark ticker", value="^GSPC")
 
         col1, col2 = st.columns(2)
         with col1:
             start = st.date_input(
-                "Start (approx)",
+                "Start date",
                 value=date(2004, 11, 30),
                 min_value=date(1990, 1, 1),
-                max_value=today,
+                max_value=today_date,
                 key="start_date",
             )
         with col2:
             end = st.date_input(
-                "End (approx)",
-                value=today,
+                "End date",
+                value=today_date,
                 min_value=date(1990, 1, 1),
-                max_value=today,
+                max_value=today_date,
                 key="end_date",
             )
 
+        use_max_dates = st.checkbox(
+            "Use max dates",
+            value=False,
+            help="Automatically determine the earliest common start date across all tickers in the universe and benchmark. End date will be yesterday.",
+        )
+
         use_calendar_month_end = st.checkbox("Calendar month-end momentum sampling", value=False)
+
         starting_capital = st.number_input("Starting capital", value=100000.0, step=1000.0)
 
         st.subheader("Costs")
@@ -896,6 +971,7 @@ def app():
             step=1,
             help="Used only to mark-to-market holdings on days where Yahoo returns missing prices.",
         )
+
         guardrail_enabled = st.checkbox("Enable guardrail", value=True)
         guardrail_drop_pct = st.slider(
             "Guardrail drop threshold (fraction)",
@@ -914,12 +990,32 @@ def app():
         if len(universe) < 5:
             st.error("Universe must contain at least 5 tickers.")
             st.stop()
-        if end <= start:
+
+        # Handle max dates mode
+        is_max_mode = use_max_dates
+        limiting_symbol = None
+        start_used = start
+        end_used = end
+
+        if is_max_mode:
+            with st.spinner("Calculating maximum common date range..."):
+                benchmark_clean = benchmark.strip()
+                all_symbols = list(universe) + ([benchmark_clean] if benchmark_clean else [])
+                common_start, limiting_symbol = find_max_common_start_date(all_symbols)
+                
+                if common_start is None:
+                    st.error("Unable to determine maximum date range for the provided symbols.")
+                    st.stop()
+                
+                start_used = common_start
+                end_used = yesterday
+
+        if end_used <= start_used:
             st.error("End date must be after start date.")
             st.stop()
 
-        start_iso = pd.Timestamp(start).date().isoformat()
-        end_iso = pd.Timestamp(end).date().isoformat()
+        start_iso = pd.Timestamp(start_used).date().isoformat()
+        end_iso = pd.Timestamp(end_used).date().isoformat()
 
         with st.spinner("Running backtest..."):
             res = run_backtest_cached(
@@ -935,6 +1031,15 @@ def app():
                 valuation_ffill_limit=int(valuation_ffill_limit),
                 guardrail_enabled=bool(guardrail_enabled),
                 guardrail_drop_pct=float(guardrail_drop_pct),
+                max_mode_info=(is_max_mode, limiting_symbol, start_iso),
+            )
+
+        # Display max mode info if applicable
+        is_max_mode_result, limiting_symbol_result, start_date_result = res.max_mode_info
+        if is_max_mode_result and limiting_symbol_result and start_date_result:
+            st.info(
+                f"**Max date mode:** Using earliest common start date **{start_date_result.strftime('%d/%m/%Y')}** "
+                f"to **{end_used.strftime('%d/%m/%Y')}**, which is the maximum range available for **{limiting_symbol_result}**."
             )
 
         st.caption(f"Requested window: {start_iso} to {end_iso} | First execution date: {res.first_exec_date.date().isoformat()}")
@@ -951,13 +1056,11 @@ def app():
         st.subheader("Metrics (daily returns)")
         if res.metrics is not None and not res.metrics.empty:
             m = res.metrics.copy()
-
             # Convert selected columns from fraction to percentage with 2dp
             pct_cols = ["Annualized Return", "Annualized Volatility", "Maximum Drawdown", "Annualized Alpha"]
             for col in pct_cols:
                 if col in m.columns:
                     m[col] = (m[col].astype(float) * 100).map("{:.2f}%".format)
-
             st.dataframe(m, use_container_width=True)
         else:
             st.info("Metrics table is empty.")
@@ -984,10 +1087,10 @@ def app():
             st.write(f"Price spikes corrected: {len(res.spike_report)}")
             if res.spike_report:
                 st.dataframe(pd.DataFrame(res.spike_report), use_container_width=True)
+
             st.write(f"Backfills applied: {len(res.backfills)}")
             if res.backfills:
                 st.dataframe(pd.DataFrame([e.__dict__ for e in res.backfills]), use_container_width=True)
-
 
 if __name__ == "__main__":
     app()
