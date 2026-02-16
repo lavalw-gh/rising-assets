@@ -3,6 +3,7 @@
 Changes in v5.3:
 - Adds "Use max dates" checkbox to automatically determine the maximum common date range
   across all tickers in the universe and benchmark.
+- Metrics table now shows both Rising Assets strategy and Benchmark metrics
 
 Fixes vs v5
 - Adds guardrail + valuation forward-fill to prevent spurious near-zero equity caused by missing prices.
@@ -490,10 +491,16 @@ def compute_drawdown(equity: pd.Series) -> pd.Series:
     dd = (eq / peak) - 1.0
     return dd.reindex(equity.index)
 
-def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = None) -> pd.DataFrame:
+def calculate_single_equity_metrics(equity: pd.Series) -> Dict:
+    """Calculate metrics for a single equity series."""
     eq = equity.dropna()
     if len(eq) < 2:
-        return pd.DataFrame()
+        return {
+            "Annualized Return": np.nan,
+            "Annualized Volatility": np.nan,
+            "Maximum Drawdown": np.nan,
+            "Sharpe (rf=0)": np.nan,
+        }
 
     rets = eq.pct_change().dropna()
     ann = 252.0
@@ -504,14 +511,30 @@ def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = No
     sharpe = (float(rets.mean()) / float(rets.std(ddof=1))) * math.sqrt(ann) if rets.std(ddof=1) > 0 else np.nan
     max_dd = float(compute_drawdown(eq).min())
 
-    out = {
+    return {
         "Annualized Return": cagr,
         "Annualized Volatility": vol,
         "Maximum Drawdown": max_dd,
         "Sharpe (rf=0)": sharpe,
     }
 
+def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = None, benchmark_name: str = "Benchmark") -> pd.DataFrame:
+    """Calculate metrics for strategy and optionally benchmark, with alpha/beta."""
+    
+    # Calculate strategy metrics
+    strategy_metrics = calculate_single_equity_metrics(equity)
+    strategy_metrics["Name"] = "Rising Assets"
+    
+    rows = [strategy_metrics]
+    
+    # Calculate benchmark metrics if available
     if bench_equity is not None:
+        bench_metrics = calculate_single_equity_metrics(bench_equity)
+        bench_metrics["Name"] = benchmark_name
+        rows.append(bench_metrics)
+        
+        # Add beta and alpha to strategy row
+        eq = equity.dropna()
         bq = bench_equity.dropna().reindex(eq.index).dropna()
         aligned = eq.reindex(bq.index)
         if len(bq) >= 2 and len(aligned) >= 2:
@@ -522,11 +545,14 @@ def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = No
             rb = rb.reindex(idx)
             if len(idx) >= 10 and float(rb.var(ddof=1)) > 0:
                 beta = float(rs.cov(rb) / rb.var(ddof=1))
-                alpha_ann = float((rs.mean() - beta * rb.mean()) * ann)
-                out["Beta vs Benchmark"] = beta
-                out["Annualized Alpha"] = alpha_ann
-
-    return pd.DataFrame([out])
+                alpha_ann = float((rs.mean() - beta * rb.mean()) * 252.0)
+                rows[0]["Beta vs Benchmark"] = beta
+                rows[0]["Annualized Alpha"] = alpha_ann
+    
+    df = pd.DataFrame(rows)
+    # Reorder columns to put Name first
+    cols = ["Name"] + [c for c in df.columns if c != "Name"]
+    return df[cols]
 
 @dataclass
 class EquityIssue:
@@ -552,7 +578,8 @@ class BacktestResult:
     backfills: List[BackfillEvent]
     equity_issues: pd.DataFrame
     first_exec_date: pd.Timestamp
-    max_mode_info: Tuple[bool, str | None, date | None]  # (is_max_mode, limiting_symbol, start_date)
+    max_mode_info: Tuple[bool, str | None, date | None]
+    benchmark_name: str
 
 @st.cache_data(show_spinner=False)
 def run_backtest_cached(
@@ -568,7 +595,7 @@ def run_backtest_cached(
     valuation_ffill_limit: int,
     guardrail_enabled: bool,
     guardrail_drop_pct: float,
-    max_mode_info: Tuple[bool, str | None, str | None],  # (is_max_mode, limiting_symbol, start_date_iso)
+    max_mode_info: Tuple[bool, str | None, str | None],
 ) -> BacktestResult:
     start = pd.Timestamp(start_iso)
     end = pd.Timestamp(end_iso)
@@ -733,7 +760,7 @@ def run_backtest_cached(
     dd = compute_drawdown(equity)
     dd_b = compute_drawdown(bench_equity) if bench_equity is not None else None
 
-    metrics = metrics_from_daily(equity, bench_equity)
+    metrics = metrics_from_daily(equity, bench_equity, benchmark_name=benchmark if benchmark else "Benchmark")
 
     trades_df = pd.DataFrame(
         [
@@ -774,6 +801,7 @@ def run_backtest_cached(
         equity_issues=issues_df,
         first_exec_date=first_exec_dt,
         max_mode_info=(is_max_mode, limiting_symbol, start_date_for_result),
+        benchmark_name=benchmark if benchmark else "Benchmark",
     )
 
 # =========================
@@ -851,14 +879,12 @@ def try_plotly_png(fig: go.Figure, scale: float = 2.0) -> Optional[bytes]:
     except Exception:
         return None
 
-def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure, benchmark: str) -> bytes:
+def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         wb = writer.book
 
         metrics = res.metrics.copy()
-        if not metrics.empty:
-            metrics.insert(0, "Benchmark", benchmark)
         metrics.to_excel(writer, sheet_name="Metrics", index=False)
 
         df_eq = pd.DataFrame({"Equity": res.equity_daily})
@@ -1061,7 +1087,7 @@ def app():
             for col in pct_cols:
                 if col in m.columns:
                     m[col] = (m[col].astype(float) * 100).map("{:.2f}%".format)
-            st.dataframe(m, use_container_width=True)
+            st.dataframe(m, use_container_width=True, hide_index=True)
         else:
             st.info("Metrics table is empty.")
 
@@ -1074,7 +1100,7 @@ def app():
         st.subheader("Equity issues (guardrail log)")
         st.dataframe(res.equity_issues, use_container_width=True)
 
-        excel_bytes = build_excel_bytes(res, eq_fig, dd_fig, benchmark)
+        excel_bytes = build_excel_bytes(res, eq_fig, dd_fig)
         filename = f"RisingAssets_Backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         st.download_button(
             label="Download Excel",
