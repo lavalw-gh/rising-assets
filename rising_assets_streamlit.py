@@ -313,6 +313,45 @@ def price_on_or_before(
         return first_px
     return float(eligible.iloc[-1])
 
+def price_on_or_after(
+    prices: pd.DataFrame,
+    ticker: str,
+    dt: pd.Timestamp,
+    lookahead_days: int,
+    backfills: List[BackfillEvent],
+    context: str,
+) -> float:
+    """Return the first valid (positive) price on `dt` or within `lookahead_days` after.
+
+    This is used to handle cases where Yahoo data is missing on a rebalance execution day
+    (e.g., month-end close is NaN for a ticker). If we have to use a later date, we log
+    a BackfillEvent so the UI/Excel can show which ticker and which period were affected.
+    """
+    s = prices[ticker]
+    dt = pd.Timestamp(dt)
+    end_dt = dt + pd.Timedelta(days=int(lookahead_days))
+
+    window = s.loc[dt:end_dt].dropna()
+    if not window.empty:
+        window = window[window > 0]
+    if window.empty:
+        raise ValueError(f"No valid price for {ticker} on/after {dt.date()} within {lookahead_days}d")
+
+    used_dt = pd.Timestamp(window.index[0])
+    used_px = float(window.iloc[0])
+    if used_dt != dt:
+        backfills.append(
+            BackfillEvent(
+                ticker=ticker,
+                needed_date=dt,
+                used_date=used_dt,
+                used_price=used_px,
+                context=context,
+            )
+        )
+    return used_px
+
+
 def calculate_volatility_asof(prices: pd.DataFrame, asof_dt: pd.Timestamp, window: int = 63) -> pd.Series:
     asof_dt = pd.Timestamp(asof_dt)
     px = prices.loc[:asof_dt].copy()
@@ -744,7 +783,8 @@ def run_backtest_cached(
 
     buffer_days = 900
     fetch_start = start - pd.Timedelta(days=buffer_days)
-    fetch_end = end + pd.Timedelta(days=10)
+    exec_price_lookahead_days = 3
+    fetch_end = end + pd.Timedelta(days=max(10, exec_price_lookahead_days + 3))
 
     tickers_all = tickers + ([benchmark] if benchmark and benchmark not in tickers else [])
 
@@ -808,9 +848,19 @@ def run_backtest_cached(
             mom_df = calculate_momentum_scores_asof(prices, signal_dt, use_calendar_month_end, backfills)
         vol = calculate_volatility_asof(prices, signal_dt, window=63)
         valid_mom = mom_df["Momentum Score"].dropna()
+        # Use valuation prices (limited forward-fill) for portfolio value before trading so
+        # missing raw Yahoo prices do not make the portfolio look artificially near-zero.
+        px_row_val_exec = prices_val.loc[:exec_dt].iloc[-1]
+        port_val_before = compute_portfolio_value(holdings, px_row_val_exec, cash)
+
+        # For execution/trading prices, prefer the exec day price; if it is missing for a
+        # ticker, look forward a few days and use the next available valid price (logged
+        # to `backfills` so you can see which ticker/period needed replacement).
+        # Note: this uses already-fetched Yahoo data; `fetch_end` is extended to include
+        # the lookahead window.
+        exec_price_lookahead_days_local = 3
         px_row_exec = prices.loc[:exec_dt].iloc[-1]
 
-        port_val_before = compute_portfolio_value(holdings, px_row_exec, cash)
 
         if len(valid_mom) < 5:
             reb_rows.append(
@@ -827,6 +877,35 @@ def run_backtest_cached(
             )
         else:
             top5 = valid_mom.nlargest(5).index.tolist()
+
+            # Build execution price row (with forward lookahead for missing prices)
+            tickers_for_exec = sorted(set(holdings.keys()) | set(top5))
+            px_exec: Dict[str, float] = {}
+            for t in tickers_for_exec:
+                # Try on/after exec_dt first (user requested: if month-end is missing,
+                # check a few days after and use the next available price).
+                try:
+                    px_exec[t] = price_on_or_after(
+                        prices,
+                        t,
+                        exec_dt,
+                        lookahead_days=exec_price_lookahead_days_local,
+                        backfills=backfills,
+                        context=f"Exec price forward-fill (rebalance exec {exec_dt.date()})",
+                    )
+                except Exception:
+                    # If no forward price exists (e.g., end of available history), fall back
+                    # to the last known price on/before exec_dt (also logged if it backfills).
+                    px_exec[t] = price_on_or_before(
+                        prices,
+                        t,
+                        exec_dt,
+                        backfills,
+                        context=f"Exec price backward-fill fallback (rebalance exec {exec_dt.date()})",
+                    )
+
+            px_row_exec = pd.Series(px_exec, name=exec_dt)
+
             w = calculate_inverse_volatility_weights(vol.reindex(top5))
             target = target_integer_shares(top5, w, px_row_exec, port_val_before)
             holdings, cash, fills = rebalance_to_target(exec_dt, holdings, cash, target, px_row_exec, include_costs, cost_per_trade)
