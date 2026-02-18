@@ -1,6 +1,6 @@
-"""Rising Assets Strategy — Streamlit Backtester (v5.3)
+"""Rising Assets Strategy — Streamlit Backtester (v6.0)
 
-Changes in v5.3:
+Changes in v6.0:
 - Adds "Use max dates" checkbox to automatically determine the maximum common date range
   across all tickers in the universe and benchmark.
 - Metrics table now shows both Rising Assets strategy and Benchmark metrics
@@ -391,6 +391,140 @@ def calculate_momentum_scores_asof(
     df["Momentum Score"] = df.mean(axis=1)
     return df
 
+
+def calculate_momentum_scores_asof_relative_12_1(
+    prices: pd.DataFrame,
+    asof_dt: pd.Timestamp,
+    use_calendar_month_end: bool,
+    backfills: List[BackfillEvent],
+) -> pd.DataFrame:
+    """
+    Compute 12–1 relative momentum (12-month return skipping the most recent month)
+    as of `asof_dt`.
+
+    - If `use_calendar_month_end` is True, use calendar month-end anchors:
+      momentum = price(month_end[T-2]) / price(month_end[T-13]) - 1,
+      where T is the month containing `asof_dt`.
+    - Otherwise, use daily returns:
+      momentum = product of daily returns over the last 252 trading days,
+      excluding the most recent 21 trading days.
+    """
+    asof_dt = pd.Timestamp(asof_dt)
+    tickers = list(prices.columns)
+
+    # If no data at all, return NaNs
+    if prices.empty:
+        return pd.DataFrame(
+            index=tickers,
+            data={"Momentum Score": np.nan},
+            dtype=float,
+        )
+
+    # ------------------------------------------------------------------
+    # 1) Calendar month-end version: 12–1 using month-end prices
+    # ------------------------------------------------------------------
+    if use_calendar_month_end:
+        # Use only data up to asof_dt
+        px = prices.loc[:asof_dt].copy()
+        if px.empty:
+            return pd.DataFrame(
+                index=tickers,
+                data={"Momentum Score": np.nan},
+                dtype=float,
+            )
+
+        # Month-end trading days up to asof_dt
+        me_idx = month_end_trading_days(px.index)
+        me_idx = me_idx[me_idx <= asof_dt]
+
+        # Need at least 13 month-ends: we will use
+        #   start = month_end[T-13]
+        #   end   = month_end[T-2]
+        # so we skip the most recent month (T-1 .. T).
+        if len(me_idx) < 13:
+            return pd.DataFrame(
+                index=tickers,
+                data={"Momentum Score": np.nan},
+                dtype=float,
+            )
+
+        # T is the last month-end <= asof_dt
+        # Skip the most recent month: use T-2 as end, T-13 as start.
+        mom_end_dt = me_idx[-2]
+        mom_start_dt = me_idx[-13]
+
+        scores = {}
+        for t in tickers:
+            try:
+                p_start = price_on_or_before(
+                    prices,
+                    t,
+                    mom_start_dt,
+                    backfills,
+                    context="RelMom 12-1 start (calendar)",
+                )
+                p_end = price_on_or_before(
+                    prices,
+                    t,
+                    mom_end_dt,
+                    backfills,
+                    context="RelMom 12-1 end (calendar)",
+                )
+                if p_start > 0 and p_end > 0:
+                    scores[t] = (p_end / p_start) - 1.0
+                else:
+                    scores[t] = np.nan
+            except Exception:
+                scores[t] = np.nan
+
+        df = pd.DataFrame({"Momentum Score": pd.Series(scores)})
+        # Ensure all universe tickers are present
+        df = df.reindex(tickers)
+        return df
+
+    # ------------------------------------------------------------------
+    # 2) Daily version: 12–1 using daily returns
+    # ------------------------------------------------------------------
+    # Use data up to asof_dt only
+    px = prices.loc[:asof_dt].copy()
+    if px.empty:
+        return pd.DataFrame(
+            index=tickers,
+            data={"Momentum Score": np.nan},
+            dtype=float,
+        )
+
+    # Daily returns
+    rets = px.pct_change().dropna(how="all")
+    # We approximate:
+    #   12 months  ≈ 252 trading days
+    #   1 month    ≈ 21 trading days
+    lookback_days = 252
+    skip_days = 21
+    required_len = lookback_days + skip_days
+
+    if len(rets) < required_len:
+        # Not enough history yet for a proper 12–1; return NaNs
+        return pd.DataFrame(
+            index=tickers,
+            data={"Momentum Score": np.nan},
+            dtype=float,
+        )
+
+    # Take the last (252 + 21) daily returns and drop the most recent 21 days:
+    # window: rets[t-252-skip .. t-skip-1]
+    window = rets.iloc[-required_len:-skip_days]
+
+    # Compute cumulative return over that window per asset: (Π (1+r)) - 1
+    # Guard against all-NaN columns.
+    valid_counts = window.notna().sum(axis=0)
+    cum_prod = (1.0 + window).prod(axis=0)
+    scores_series = (cum_prod - 1.0).where(valid_counts > 0, np.nan)
+
+    df = pd.DataFrame({"Momentum Score": scores_series})
+    df = df.reindex(tickers)
+    return df
+
 # =========================
 # Portfolio + backtest
 # =========================
@@ -588,6 +722,7 @@ def run_backtest_cached(
     end_iso: str,
     benchmark: str,
     use_calendar_month_end: bool,
+    momentum_model: str,
     starting_capital: float,
     include_costs: bool,
     cost_per_trade: float,
@@ -667,7 +802,10 @@ def run_backtest_cached(
         signal_dt = pd.Timestamp(month_ends[i - 1])
         exec_dt = pd.Timestamp(month_ends[i])
 
-        mom_df = calculate_momentum_scores_asof(prices, signal_dt, use_calendar_month_end, backfills)
+        if momentum_model == "Relative 12-1":
+            mom_df = calculate_momentum_scores_asof_relative_12_1(prices, signal_dt, use_calendar_month_end, backfills)
+        else:
+            mom_df = calculate_momentum_scores_asof(prices, signal_dt, use_calendar_month_end, backfills)
         vol = calculate_volatility_asof(prices, signal_dt, window=63)
         valid_mom = mom_df["Momentum Score"].dropna()
         px_row_exec = prices.loc[:exec_dt].iloc[-1]
@@ -936,7 +1074,7 @@ def default_universe() -> str:
 
 def app():
     st.set_page_config(page_title="Rising Assets Backtester", layout="wide")
-    st.title("Rising Assets — Streamlit Backtester 5.3")
+    st.title("Rising Assets — Streamlit Backtester 6.0")
 
     today_date = date.today()
     yesterday = today_date - timedelta(days=1)
@@ -974,6 +1112,12 @@ def app():
         use_calendar_month_end = st.checkbox("Calendar month-end momentum sampling", value=False)
 
         starting_capital = st.number_input("Starting capital", value=100000.0, step=1000.0)
+
+        momentum_model = st.selectbox(
+            "Momentum model",
+            ["Alpha Rising Assets", "Relative 12-1"],
+            index=0,
+        )
 
         st.subheader("Costs")
         include_costs = st.checkbox("Include transaction costs", value=False)
@@ -1050,6 +1194,7 @@ def app():
                 end_iso=end_iso,
                 benchmark=benchmark.strip(),
                 use_calendar_month_end=use_calendar_month_end,
+                momentum_model=momentum_model,
                 starting_capital=float(starting_capital),
                 include_costs=bool(include_costs),
                 cost_per_trade=float(cost_per_trade),
