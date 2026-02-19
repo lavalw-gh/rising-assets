@@ -243,9 +243,27 @@ def fetch_price_data_stooq_cached(tickers: Tuple[str, ...], start_iso: str, end_
         raise ValueError("No tickers provided.")
 
     series: Dict[str, pd.Series] = {}
+    failures: Dict[str, str] = {}
+    
     for t in tlist:
-        series[t] = fetch_stooq_close_cached(t, start_iso, end_iso)
-
+        try:
+            s = fetch_stooq_close_cached(t, start_iso, end_iso)
+            s = s.dropna()
+            if s.empty:
+                failures[t] = "Returned only NaNs / empty close series"
+                continue
+            series[t] = s
+        except Exception as e:
+            failures[t] = f"{type(e).__name__}: {e}"
+    
+    # STRICT MODE: stop early with an explicit list of problem tickers
+    if failures:
+        details = "\n".join([f"- {k}: {v}" for k, v in sorted(failures.items())])
+        raise ValueError(
+            "Stooq fetch failed for these tickers (remove/fix them in the universe):\n"
+            f"{details}"
+        )
+    
     prices = pd.DataFrame(series)
     prices.index = pd.to_datetime(prices.index)
     prices = prices.sort_index().dropna(axis=1, how="all")
