@@ -217,7 +217,6 @@ def fetch_stooq_close_cached(ticker: str, start_iso: str, end_iso: str) -> pd.Se
     except Exception as e:
         raise ValueError(f"Stooq download failed for '{t}': {e}")
     finally:
-        # Rate limiting
         time.sleep(STOOQ_REQUEST_DELAY_SEC)
 
     if df is None or df.empty:
@@ -844,12 +843,11 @@ def run_backtest_cached(
 
     first_exec = exec_month_ends[0]
     
+    prior_month_ends = all_month_ends[all_month_ends < first_exec]
 
-prior_month_ends = all_month_ends[all_month_ends < first_exec]
+    start_shift_note = ""
 
-start_shift_note = ""
-
-if len(prior_month_ends) == 0:
+    if len(prior_month_ends) == 0:
     # No prior month-end is available for the look-ahead fix.
     # Shift the first execution forward by one month-end:
     # signal_dt = exec_month_ends[0], exec_dt = exec_month_ends[1].
@@ -864,7 +862,7 @@ if len(prior_month_ends) == 0:
         f"Start shifted: no prior month-end before {pd.Timestamp(first_signal).date()} "
         f"for look-ahead fix; first execution is {pd.Timestamp(exec_month_ends_adj[0]).date()}."
     )
-else:
+    else:
     first_signal = prior_month_ends[-1]
     month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends)
 
