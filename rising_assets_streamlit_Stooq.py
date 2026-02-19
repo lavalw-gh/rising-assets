@@ -1047,7 +1047,7 @@ else:
     is_max_mode, limiting_symbol, start_date_iso = max_mode_info
     start_date_for_result = date.fromisoformat(start_date_iso) if start_date_iso else None
 
-      return BacktestResult(
+  return BacktestResult(
         equity_daily=equity,
         equity_benchmark_daily=bench_equity,
         drawdown_daily=dd,
