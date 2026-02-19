@@ -845,28 +845,28 @@ def run_backtest_cached(
 
     first_exec = exec_month_ends[0]
 
-prior_month_ends = all_month_ends[all_month_ends < first_exec]
+    prior_month_ends = all_month_ends[all_month_ends < first_exec]
 
-start_shift_note = ""
+    start_shift_note = ""
 
-if len(prior_month_ends) == 0:
-    # No prior month-end is available for the look-ahead fix.
-    # Shift the first execution forward by one month-end:
-    # signal_dt = exec_month_ends[0], exec_dt = exec_month_ends[1].
-    if len(exec_month_ends) < 2:
-        raise ValueError("Not enough month-end trading dates in selected range.")
+    if len(prior_month_ends) == 0:
+        # No prior month-end is available for the look-ahead fix.
+        # Shift the first execution forward by one month-end.
+        if len(exec_month_ends) < 2:
+            raise ValueError("Not enough month-end trading dates in selected range.")
 
-    first_signal = exec_month_ends[0]
-    exec_month_ends_adj = exec_month_ends[1:]
-    month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends_adj)
+        first_signal = exec_month_ends[0]
+        exec_month_ends_adj = exec_month_ends[1:]
+        month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends_adj)
 
-    start_shift_note = (
-        f"Start shifted: no prior month-end before {pd.Timestamp(first_signal).date()} "
-        f"for look-ahead fix; first execution is {pd.Timestamp(exec_month_ends_adj[0]).date()}."
-    )
-else:
-    first_signal = prior_month_ends[-1]
-    month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends)
+        start_shift_note = (
+            f"Start shifted: no prior month-end before {pd.Timestamp(first_signal).date()} "
+            f"for look-ahead fix; first execution is {pd.Timestamp(exec_month_ends_adj[0]).date()}."
+        )
+    else:
+        first_signal = prior_month_ends[-1]
+        month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends)
+
     prices_val = prices.ffill(limit=int(valuation_ffill_limit)) if valuation_ffill_limit > 0 else prices.copy()
 
     holdings: Dict[str, int] = {}
