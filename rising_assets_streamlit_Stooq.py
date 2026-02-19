@@ -1,4 +1,4 @@
-"""Rising Assets Strategy — Streamlit Stooq Backtester (v7.1)
+"""Rising Assets Strategy — Streamlit Stooq Backtester (v7.2)
 
 Changes in v6.0:
 - Adds "Use max dates" checkbox to automatically determine the maximum common date range
@@ -298,6 +298,8 @@ def apply_hampel_filter_to_prices(prices: pd.DataFrame, window: int = 21, n_sigm
             r["Ticker"] = t
         report.extend(rep)
     return cleaned, report
+
+
 # =========================
 # Strategy calculations
 # =========================
@@ -842,7 +844,7 @@ def run_backtest_cached(
         raise ValueError("Not enough month-end trading dates in selected range.")
 
     first_exec = exec_month_ends[0]
-    
+
 prior_month_ends = all_month_ends[all_month_ends < first_exec]
 
 start_shift_note = ""
@@ -865,7 +867,6 @@ if len(prior_month_ends) == 0:
 else:
     first_signal = prior_month_ends[-1]
     month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends)
-
     prices_val = prices.ffill(limit=int(valuation_ffill_limit)) if valuation_ffill_limit > 0 else prices.copy()
 
     holdings: Dict[str, int] = {}
@@ -1047,7 +1048,7 @@ else:
     is_max_mode, limiting_symbol, start_date_iso = max_mode_info
     start_date_for_result = date.fromisoformat(start_date_iso) if start_date_iso else None
 
-  return BacktestResult(
+    return BacktestResult(
         equity_daily=equity,
         equity_benchmark_daily=bench_equity,
         drawdown_daily=dd,
@@ -1166,7 +1167,6 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure)
         ws_notes.write(1, 0, "Cash earns 0%.")
         ws_notes.write(2, 0, "Signals computed as-of prior month-end trading day; trades executed at month-end close.")
         ws_notes.write(3, 0, "Stooq daily Close prices used; Hampel filter applied (k=5, window=21 trading days).")
-
         if getattr(res, "start_shift_note", ""):
             ws_notes.write(4, 0, res.start_shift_note)
         
@@ -1200,7 +1200,7 @@ def default_universe() -> str:
 
 def app():
     st.set_page_config(page_title="Rising Assets Stooq Backtester", layout="wide")
-    st.title("Rising Assets Strategy — Streamlit Stooq Backtester (v7.1)")
+    st.title("Rising Assets Strategy — Streamlit Stooq Backtester (v7.2)")
 
     today_date = date.today()
     yesterday = today_date - timedelta(days=1)
