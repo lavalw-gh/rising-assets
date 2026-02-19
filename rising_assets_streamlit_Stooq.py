@@ -862,7 +862,7 @@ if len(prior_month_ends) == 0:
         f"Start shifted: no prior month-end before {pd.Timestamp(first_signal).date()} "
         f"for look-ahead fix; first execution is {pd.Timestamp(exec_month_ends_adj[0]).date()}."
     )
-    else:
+else:
     first_signal = prior_month_ends[-1]
     month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends)
 
