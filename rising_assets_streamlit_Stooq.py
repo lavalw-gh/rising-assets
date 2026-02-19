@@ -77,39 +77,45 @@ def month_end_trading_days(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
 # Max date range determination
 # =========================
 
-
 def find_max_common_start_date(symbols: List[str]) -> Tuple[date | None, str | None]:
-    """Determine the earliest common start date across symbols using Stooq daily Close.
-
-    We fetch long history (from 1990) per symbol and take each symbol's first valid date.
-    The common start date is the latest of those first-valid dates.
+    """Strict max-date: either returns (common_start_date, limiting_symbol)
+    or raises a ValueError listing symbols with no Stooq data.
     """
     if not symbols:
-        return None, None
+        raise ValueError("No symbols provided for max-date mode.")
 
     early_start = date(1990, 1, 1)
     today_date = date.today()
 
     first_dates: Dict[str, date] = {}
+    failures: Dict[str, str] = {}
+
     for sym in symbols:
         sym = (sym or "").strip()
         if not sym:
             continue
+
         try:
             s = fetch_stooq_close_cached(sym, early_start.isoformat(), today_date.isoformat())
             s = s.dropna()
             if s.empty:
+                failures[sym] = "No data returned (empty series)"
                 continue
             first_dates[sym] = pd.Timestamp(s.index[0]).date()
-        except Exception:
-            continue
+        except Exception as e:
+            failures[sym] = f"{type(e).__name__}: {e}"
 
-    if not first_dates:
-        return None, None
+    # STRICT: if anything failed, force user to fix universe (recommended)
+    if failures:
+        details = "\n".join([f"- {k}: {v}" for k, v in sorted(failures.items())])
+        raise ValueError(
+            "Max-date mode failed because these symbols have no Stooq data:\n"
+            f"{details}"
+        )
 
+    # Now compute common start (latest of the first-available dates)
     limiting_symbol = max(first_dates, key=first_dates.get)
     return first_dates[limiting_symbol], limiting_symbol
-
 
 # =========================
 # Data fetch + cleaning
@@ -1306,11 +1312,11 @@ def app():
             with st.spinner("Calculating maximum common date range..."):
                 benchmark_clean = benchmark.strip()
                 all_symbols = list(universe) + ([benchmark_clean] if benchmark_clean else [])
-                common_start, limiting_symbol = find_max_common_start_date(all_symbols)
-                
-                if common_start is None:
-                    st.error("Unable to determine maximum date range for the provided symbols.")
-                    st.stop()
+        try:
+            common_start, limiting_symbol = find_max_common_start_date(all_symbols)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
                 
                 start_used = common_start
                 end_used = yesterday
