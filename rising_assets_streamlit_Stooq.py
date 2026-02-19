@@ -27,6 +27,7 @@ pip install kaleido
 from __future__ import annotations
 
 import io
+import requests
 import math
 import time
 from dataclasses import dataclass
@@ -122,7 +123,7 @@ def find_max_common_start_date(symbols: List[str]) -> Tuple[date | None, str | N
 # =========================
 
 
-STOOQ_BASE_URL = "https://stooq.com/q/d/l/"
+STOOQ_BASE_URL = "https://stooq.pl/q/d/l/"
 STOOQ_INTERVAL = "d"  # always daily
 STOOQ_REQUEST_DELAY_SEC = 0.5
 
@@ -219,12 +220,36 @@ def fetch_stooq_close_cached(ticker: str, start_iso: str, end_iso: str) -> pd.Se
     url = f"{STOOQ_BASE_URL}?{urlencode(params)}"
 
     try:
-        df = pd.read_csv(url)
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (compatible; rising-assets/1.0)",
+                "Accept": "text/csv,text/plain,*/*",
+            }
+        )
+
+        # Warm-up request (helps in some hosted environments)
+        warmup_host = "https://stooq.pl" if "stooq.pl" in STOOQ_BASE_URL else "https://stooq.com"
+        session.get(warmup_host, timeout=20)
+
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+
+        txt = resp.text or ""
+        if not txt.strip():
+            raise ValueError("Empty response body")
+
+        # If Stooq returns HTML (block page / redirect), fail with a useful message
+        if txt.lstrip().startswith("<"):
+            raise ValueError(f"Non-CSV response (looks like HTML), status={resp.status_code}")
+
+        df = pd.read_csv(io.StringIO(txt))
+
     except Exception as e:
         raise ValueError(f"Stooq download failed for '{t}': {e}")
     finally:
         time.sleep(STOOQ_REQUEST_DELAY_SEC)
-
+  
     if df is None or df.empty:
         raise ValueError(f"No data returned from Stooq for '{t}'.")
 
