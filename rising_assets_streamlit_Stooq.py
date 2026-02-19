@@ -1,4 +1,4 @@
-"""Rising Assets Strategy — Streamlit Stooq Backtester (v7.0)
+"""Rising Assets Strategy — Streamlit Stooq Backtester (v7.1)
 
 Changes in v6.0:
 - Adds "Use max dates" checkbox to automatically determine the maximum common date range
@@ -81,7 +81,7 @@ def month_end_trading_days(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
 def find_max_common_start_date(symbols: List[str]) -> Tuple[date | None, str | None]:
     """Determine the earliest common start date across symbols using Stooq daily Close.
 
-    We fetch a long history (from 1990) and take each symbol's first valid date.
+    We fetch long history (from 1990) per symbol and take each symbol's first valid date.
     The common start date is the latest of those first-valid dates.
     """
     if not symbols:
@@ -180,6 +180,7 @@ def normalize_prices_to_gbp_from_yahoo_currency(prices: pd.DataFrame) -> pd.Data
     """Convert Stooq closes into GBP where Yahoo reports currency GBp (pence)."""
     if prices.empty:
         return prices
+
     tickers = list(prices.columns)
     cur_tbl = get_yahoo_currency_table_cached(tuple(tickers))
     if cur_tbl is None or cur_tbl.empty:
@@ -216,6 +217,7 @@ def fetch_stooq_close_cached(ticker: str, start_iso: str, end_iso: str) -> pd.Se
     except Exception as e:
         raise ValueError(f"Stooq download failed for '{t}': {e}")
     finally:
+        # Rate limiting
         time.sleep(STOOQ_REQUEST_DELAY_SEC)
 
     if df is None or df.empty:
@@ -776,6 +778,7 @@ class BacktestResult:
     backfills: List[BackfillEvent]
     equity_issues: pd.DataFrame
     first_exec_date: pd.Timestamp
+    start_shift_note: str
     max_mode_info: Tuple[bool, str | None, date | None]
     benchmark_name: str
 
@@ -840,11 +843,28 @@ def run_backtest_cached(
         raise ValueError("Not enough month-end trading dates in selected range.")
 
     first_exec = exec_month_ends[0]
-    prior_month_ends = all_month_ends[all_month_ends < first_exec]
+    
 
-    if len(prior_month_ends) == 0:
-        raise ValueError("Need at least one prior month-end trading day before start for look-ahead fix.")
+prior_month_ends = all_month_ends[all_month_ends < first_exec]
 
+start_shift_note = ""
+
+if len(prior_month_ends) == 0:
+    # No prior month-end is available for the look-ahead fix.
+    # Shift the first execution forward by one month-end:
+    # signal_dt = exec_month_ends[0], exec_dt = exec_month_ends[1].
+    if len(exec_month_ends) < 2:
+        raise ValueError("Not enough month-end trading dates in selected range.")
+
+    first_signal = exec_month_ends[0]
+    exec_month_ends_adj = exec_month_ends[1:]
+    month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends_adj)
+
+    start_shift_note = (
+        f"Start shifted: no prior month-end before {pd.Timestamp(first_signal).date()} "
+        f"for look-ahead fix; first execution is {pd.Timestamp(exec_month_ends_adj[0]).date()}."
+    )
+else:
     first_signal = prior_month_ends[-1]
     month_ends = pd.DatetimeIndex([first_signal]).append(exec_month_ends)
 
@@ -1041,6 +1061,7 @@ def run_backtest_cached(
         backfills=backfills,
         equity_issues=issues_df,
         first_exec_date=first_exec_dt,
+        start_shift_note=start_shift_note,
         max_mode_info=(is_max_mode, limiting_symbol, start_date_for_result),
         benchmark_name=benchmark if benchmark else "Benchmark",
     )
@@ -1147,11 +1168,14 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure)
         ws_notes.write(1, 0, "Cash earns 0%.")
         ws_notes.write(2, 0, "Signals computed as-of prior month-end trading day; trades executed at month-end close.")
         ws_notes.write(3, 0, "Stooq daily Close prices used; Hampel filter applied (k=5, window=21 trading days).")
+
+        if getattr(res, "start_shift_note", ""):
+            ws_notes.write(4, 0, res.start_shift_note)
         
         # Add max mode note if applicable
         is_max_mode, limiting_symbol, start_date_used = res.max_mode_info
         if is_max_mode and limiting_symbol and start_date_used:
-            ws_notes.write(4, 0, f"Max date mode: earliest common start date {start_date_used.strftime('%Y-%m-%d')} (limited by {limiting_symbol}).")
+            ws_notes.write(5, 0, f"Max date mode: earliest common start date {start_date_used.strftime('%Y-%m-%d')} (limited by {limiting_symbol}).")
 
         png1 = try_plotly_png(eq_fig)
         png2 = try_plotly_png(dd_fig)
@@ -1165,7 +1189,7 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure)
             if png2 is not None:
                 ws_ch.insert_image(row, 0, "drawdown.png", {"image_data": io.BytesIO(png2)})
         else:
-            ws_notes.write(6, 0, "Chart images not embedded (install 'kaleido' to enable Plotly PNG export).")
+            ws_notes.write(5, 0, "Chart images not embedded (install 'kaleido' to enable Plotly PNG export).")
 
     return buf.getvalue()
 
@@ -1178,7 +1202,7 @@ def default_universe() -> str:
 
 def app():
     st.set_page_config(page_title="Rising Assets Stooq Backtester", layout="wide")
-    st.title("Rising Assets Strategy — Streamlit Stooq Backtester (v7.0)")
+    st.title("Rising Assets Strategy — Streamlit Stooq Backtester (v7.1)")
 
     today_date = date.today()
     yesterday = today_date - timedelta(days=1)
@@ -1293,7 +1317,7 @@ def app():
                 starting_capital=float(starting_capital),
                 include_costs=bool(include_costs),
                 cost_per_trade=float(cost_per_trade),
-                                valuation_ffill_limit=int(valuation_ffill_limit),
+                valuation_ffill_limit=int(valuation_ffill_limit),
                 guardrail_enabled=bool(guardrail_enabled),
                 guardrail_drop_pct=float(guardrail_drop_pct),
                 max_mode_info=(is_max_mode, limiting_symbol, start_iso),
@@ -1306,6 +1330,9 @@ def app():
                 f"**Max date mode:** Using earliest common start date **{start_date_result.strftime('%d/%m/%Y')}** "
                 f"to **{end_used.strftime('%d/%m/%Y')}**, which is the maximum range available for **{limiting_symbol_result}**."
             )
+
+        if getattr(res, "start_shift_note", ""):
+            st.info(res.start_shift_note)
 
         st.caption(f"Requested window: {start_iso} to {end_iso} | First execution date: {res.first_exec_date.date().isoformat()}")
 
