@@ -1312,14 +1312,14 @@ def app():
             with st.spinner("Calculating maximum common date range..."):
                 benchmark_clean = benchmark.strip()
                 all_symbols = list(universe) + ([benchmark_clean] if benchmark_clean else [])
-              try:
-                  common_start, limiting_symbol = find_max_common_start_date(all_symbols)
-              except ValueError as e:
-                  st.error(str(e))
-                  st.stop()
-                      
-              start_used = common_start
-              end_used = yesterday
+            try:
+                common_start, limiting_symbol = find_max_common_start_date(all_symbols)
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
+                    
+            start_used = common_start
+            end_used = yesterday
 
         if end_used <= start_used:
             st.error("End date must be after start date.")
