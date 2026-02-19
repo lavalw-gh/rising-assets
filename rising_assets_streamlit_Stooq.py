@@ -843,11 +843,11 @@ def run_backtest_cached(
 
     first_exec = exec_month_ends[0]
     
-    prior_month_ends = all_month_ends[all_month_ends < first_exec]
+prior_month_ends = all_month_ends[all_month_ends < first_exec]
 
-    start_shift_note = ""
+start_shift_note = ""
 
-    if len(prior_month_ends) == 0:
+if len(prior_month_ends) == 0:
     # No prior month-end is available for the look-ahead fix.
     # Shift the first execution forward by one month-end:
     # signal_dt = exec_month_ends[0], exec_dt = exec_month_ends[1].
