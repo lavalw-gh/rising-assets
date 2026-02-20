@@ -1,22 +1,27 @@
 """
-Rising Assets Strategy — Streamlit Backtester (v6.1)
+Rising Assets Strategy — Streamlit Backtester (v6.2)
 
-Changes in v6.1:
-- Comprehensive data-quality (DQ) module:
-  (1) Extreme/unit-mix fix for GBp tickers where Yahoo intermittently returns GBP-valued prints (~100x low).
-      If currency metadata is GBp, we multiply the low-cluster prices by 100 and log corrections.
-  (2) Detect likely permanent regime changes (splits/discontinuities) and abort backtest (so you can replace ticker).
-  (3) Correct single-day spikes using existing threshold logic (and log).
+Changes in v6.2:
+- Adds DQ fix for GBp/GBP unit-mix extremes (e.g., SGLN.L prints ~100x too low); logs corrections to Streamlit + Excel Notes.
+- Adds "Use max dates" checkbox to automatically determine the maximum common date range
+  across all tickers in the universe and benchmark.
+- Metrics table now shows both Rising Assets strategy and Benchmark metrics
 
-Existing core model (unchanged):
+Fixes vs v5
+- Adds guardrail + valuation forward-fill to prevent spurious near-zero equity caused by missing prices.
+- Makes start/end inputs robust (explicit min/max + widget keys).
+- Makes Streamlit caching keys robust by passing start/end as ISO strings.
+
+Core model
 - Monthly rebalance with look-ahead fix:
   * Signal computed as-of prior month-end trading day (t-1)
   * Trades executed at month-end trading day close (t)
 - Uses adjusted closes from Yahoo Finance via yfinance (auto_adjust=True).
 - Cash earns 0%.
 
-Dependencies:
+Dependencies
 pip install streamlit yfinance pandas numpy xlsxwriter plotly
+
 Optional for embedding PNG charts into Excel:
 pip install kaleido
 """
@@ -34,7 +39,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-
 
 # =========================
 # Utilities
@@ -114,7 +118,7 @@ def find_max_common_start_date(symbols: List[str]) -> Tuple[date | None, str | N
         if prices.empty:
             return None, None
 
-        first_dates: Dict[str, date] = {}
+        first_dates = {}
         for sym in symbols:
             if sym in prices.columns:
                 first_valid = prices[sym].first_valid_index()
@@ -133,12 +137,12 @@ def find_max_common_start_date(symbols: List[str]) -> Tuple[date | None, str | N
 
 
 # =========================
-# Data fetch + DQ helpers
+# Data fetch + cleaning
 # =========================
 
 @st.cache_data(show_spinner=False)
 def get_yahoo_currency(ticker: str) -> str:
-    """Best-effort currency lookup for a ticker (Yahoo Finance metadata)."""
+    """Best-effort currency lookup (Yahoo Finance metadata)."""
     try:
         tobj = yf.Ticker(ticker)
     except Exception:
@@ -168,10 +172,7 @@ def get_yahoo_currency(ticker: str) -> str:
 
 
 def normalize_prices_to_gbp(prices: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
-    """
-    Normalize prices to GBP: if Yahoo reports currency 'GBp' (pence), divide by 100.
-    (This converts pence-quoted UK instruments into GBP pounds for consistent calculations.)
-    """
+    """Normalize prices to GBP: if Yahoo reports currency 'GBp' (pence), divide by 100."""
     normalized = prices.copy()
     for ticker in tickers:
         if ticker not in normalized.columns:
@@ -182,164 +183,108 @@ def normalize_prices_to_gbp(prices: pd.DataFrame, tickers: List[str]) -> pd.Data
     return normalized
 
 
-def fix_gbp_pence_unit_mix(
-    prices: pd.DataFrame,
+def fix_gbp_unit_mix_extremes(
+    prices_gbp: pd.DataFrame,
     tickers: List[str],
     factor: float = 100.0,
-    extreme_ratio_threshold: float = 50.0,
-    cluster_tolerance: float = 0.30,
+    ratio_min: float = 50.0,
+    ratio_max: float = 150.0,
+    tol: float = 0.25,
+    rolling_window: int = 30,
 ) -> Tuple[pd.DataFrame, List[dict]]:
-    """
-    Fix GBp tickers where Yahoo intermittently returns GBP-valued prints (~100x low).
+    """Fix ~100x-too-low prints caused by GBp/GBP unit-mix issues.
 
-    Symptom: a subset of prices is ~100x lower than the main cluster.
-    If the ticker metadata currency is GBp, we assume the correct unit is pence,
-    so we multiply the low cluster by 100 (bringing it back to pence).
+    This runs AFTER `normalize_prices_to_gbp` (so series are in GBP).
+
+    Failure mode: for a ticker whose Yahoo currency is GBp, Yahoo sometimes returns
+    daily prices already in GBP (pounds). Our normalization divides by 100, making
+    those days ~100x too low (e.g., 70.55 -> 0.7055). We detect these extremes and
+    multiply the bad points by 100.
 
     Returns (fixed_prices, report_rows).
     """
-    fixed = prices.copy()
+    fixed = prices_gbp.copy()
     report: List[dict] = []
 
     for t in tickers:
         if t not in fixed.columns:
             continue
-        ccy = get_yahoo_currency(t)
-        if ccy != "GBp":
+
+        if get_yahoo_currency(t) != "GBp":
             continue
 
-        s = fixed[t]
-        v = s[(s.notna()) & (s > 0)].astype(float)
+        s = fixed[t].astype(float)
+        v = s[(s.notna()) & (s > 0)]
         if len(v) < 10:
             continue
 
-        q05 = float(v.quantile(0.05))
-        q95 = float(v.quantile(0.95))
-        if not (q05 > 0 and q95 > 0):
-            continue
+        roll_med = s.rolling(window=int(rolling_window), min_periods=max(5, int(rolling_window // 2))).median()
+        global_med = float(v.median())
+        prev = s.shift(1)
+        nxt = s.shift(-1)
 
-        # Need a very large spread to suspect unit-mix (not ordinary volatility).
-        if (q95 / q05) < extreme_ratio_threshold:
-            continue
+        for dt, cur in s.items():
+            if not (pd.notna(cur) and cur > 0):
+                continue
 
-        # Split point between clusters (geometric mean handles multiplicative gaps).
-        split_point = float(math.sqrt(q05 * q95))
-        low = v[v < split_point]
-        high = v[v >= split_point]
-        if low.empty or high.empty:
-            continue
+            # Method A: rolling median typical level
+            typ = roll_med.loc[dt]
+            if not (pd.notna(typ) and typ > 0):
+                typ = global_med
 
-        low_med = float(low.median())
-        high_med = float(high.median())
-        if not (low_med > 0 and high_med > 0):
-            continue
+            if typ and typ > 0:
+                ratio = float(typ / cur)
+                if ratio_min <= ratio <= ratio_max and abs(((cur * factor) / typ) - 1.0) <= tol:
+                    old_px = float(cur)
+                    new_px = float(cur * factor)
+                    fixed.at[dt, t] = new_px
+                    report.append(
+                        {
+                            "Ticker": t,
+                            "Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+                            "Currency": "GBp",
+                            "Issue": "GBp/GBP unit-mix extreme (corrected)",
+                            "Old Price": old_px,
+                            "New Price": new_px,
+                            "Factor": factor,
+                            "Method": "RollingMedian",
+                        }
+                    )
+                    continue
 
-        # Only apply if the clusters are consistent with a ~100x unit mix.
-        ratio = (low_med * factor) / high_med
-        if abs(ratio - 1.0) > cluster_tolerance:
-            continue
-
-        low_mask = (fixed[t].notna()) & (fixed[t] > 0) & (fixed[t] < split_point)
-        if int(low_mask.sum()) == 0:
-            continue
-
-        for dt in fixed.index[low_mask]:
-            old_px = float(fixed.at[dt, t])
-            new_px = float(old_px * factor)
-            fixed.at[dt, t] = new_px
-            report.append(
-                {
-                    "Ticker": t,
-                    "Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
-                    "Currency": ccy,
-                    "Issue": "GBp/GBP unit mix (corrected low prints)",
-                    "Old Price": old_px,
-                    "New Price": new_px,
-                    "Factor": factor,
-                }
-            )
+            # Method B: neighbor consistency (best for single-day flips)
+            p = prev.loc[dt]
+            n = nxt.loc[dt]
+            if pd.notna(p) and pd.notna(n) and (p > 0) and (n > 0):
+                r1 = float(p / cur)
+                r2 = float(n / cur)
+                if (ratio_min <= r1 <= ratio_max) and (ratio_min <= r2 <= ratio_max):
+                    if (abs(((cur * factor) / p) - 1.0) <= tol) and (abs(((cur * factor) / n) - 1.0) <= tol):
+                        old_px = float(cur)
+                        new_px = float(cur * factor)
+                        fixed.at[dt, t] = new_px
+                        report.append(
+                            {
+                                "Ticker": t,
+                                "Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+                                "Currency": "GBp",
+                                "Issue": "GBp/GBP unit-mix extreme (corrected)",
+                                "Old Price": old_px,
+                                "New Price": new_px,
+                                "Factor": factor,
+                                "Method": "Neighbors",
+                            }
+                        )
 
     return fixed, report
-
-
-def detect_structural_breaks(
-    prices: pd.DataFrame,
-    ratio_threshold: float = 1.8,
-    window: int = 20,
-    factor_tolerance: float = 0.15,
-) -> List[dict]:
-    """
-    Detect likely corporate actions / permanent regime changes (e.g., splits/discontinuities).
-
-    Flags a ticker if a large step-change persists: median level before vs after
-    differs by >= ratio_threshold over rolling windows.
-
-    Returns a list of events. Caller should *not* calculate when breaks are detected;
-    in this implementation we abort the backtest with a clear message so the user can remediate.
-    """
-    events: List[dict] = []
-    known_factors = [2, 3, 4, 5, 10, 20, 25, 50, 100]
-
-    for t in prices.columns:
-        s = prices[t].dropna().astype(float)
-        s = s[s > 0]
-        if len(s) < (2 * window + 5):
-            continue
-
-        prev = s.shift(1)
-        step_ratio = (prev / s).replace([np.inf, -np.inf], np.nan)
-        cands = step_ratio[(step_ratio >= ratio_threshold) | (step_ratio <= (1.0 / ratio_threshold))].index
-        if len(cands) == 0:
-            continue
-
-        for dt in cands:
-            pos = s.index.get_loc(dt)
-            if isinstance(pos, slice) or isinstance(pos, (list, tuple, np.ndarray)):
-                continue
-            if pos < window or (pos + window) >= len(s):
-                continue
-
-            prev_win = s.iloc[pos - window: pos]
-            post_win = s.iloc[pos: pos + window]
-            if len(prev_win) < window or len(post_win) < window:
-                continue
-
-            prev_med = float(prev_win.median())
-            post_med = float(post_win.median())
-            if not (prev_med > 0 and post_med > 0):
-                continue
-
-            level_ratio = prev_med / post_med
-            abs_ratio = level_ratio if level_ratio >= 1 else (1.0 / level_ratio)
-            if abs_ratio < ratio_threshold:
-                continue
-
-            closest = min(known_factors, key=lambda f: abs((abs_ratio / f) - 1.0))
-            close_enough = abs((abs_ratio / closest) - 1.0) <= factor_tolerance
-            factor_guess = int(closest) if close_enough else None
-
-            events.append(
-                {
-                    "Ticker": t,
-                    "Break Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
-                    "Median Before": prev_med,
-                    "Median After": post_med,
-                    "Ratio (before/after)": level_ratio,
-                    "Abs Ratio": abs_ratio,
-                    "Factor Guess": factor_guess,
-                    "Note": "Likely split/corporate action or data discontinuity; replace ticker.",
-                }
-            )
-            break
-
-    return events
 
 
 @st.cache_data(show_spinner=False)
 def fetch_price_data_robust_cached(tickers: Tuple[str, ...], start_iso: str, end_iso: str) -> pd.DataFrame:
     """
     Fetch adjusted close prices (Close) using yfinance, with fallback downloads.
-    Returns RAW adjusted closes (no currency normalization) so DQ can run first.
+    Cached in-memory per Streamlit process.
+    Uses ISO date strings for stable Streamlit caching keys.
     """
     tlist = [t for t in tickers if t]
     if not tlist:
@@ -378,6 +323,7 @@ def fetch_price_data_robust_cached(tickers: Tuple[str, ...], start_iso: str, end
         if prices.shape[1] == 0:
             raise ValueError("Could not extract price data from any ticker.")
 
+        prices = normalize_prices_to_gbp(prices, list(prices.columns))
         return prices
 
     except Exception:
@@ -401,6 +347,7 @@ def fetch_price_data_robust_cached(tickers: Tuple[str, ...], start_iso: str, end
         prices.index = pd.to_datetime(prices.index)
         prices = prices.sort_index()
         prices = prices.dropna(axis=1, how="all")
+        prices = normalize_prices_to_gbp(prices, list(prices.columns))
         return prices
 
 
@@ -760,6 +707,7 @@ def compute_drawdown(equity: pd.Series) -> pd.Series:
 
 
 def calculate_single_equity_metrics(equity: pd.Series) -> Dict:
+    """Calculate metrics for a single equity series."""
     eq = equity.dropna()
     if len(eq) < 2:
         return {
@@ -772,6 +720,7 @@ def calculate_single_equity_metrics(equity: pd.Series) -> Dict:
     rets = eq.pct_change().dropna()
     ann = 252.0
     years = len(rets) / ann
+
     cagr = (float(eq.iloc[-1]) / float(eq.iloc[0])) ** (1.0 / years) - 1.0 if years > 0 else np.nan
     vol = float(rets.std(ddof=1) * math.sqrt(ann)) if rets.std(ddof=1) > 0 else np.nan
     sharpe = (float(rets.mean()) / float(rets.std(ddof=1))) * math.sqrt(ann) if rets.std(ddof=1) > 0 else np.nan
@@ -786,6 +735,7 @@ def calculate_single_equity_metrics(equity: pd.Series) -> Dict:
 
 
 def metrics_from_daily(equity: pd.Series, bench_equity: Optional[pd.Series] = None, benchmark_name: str = "Benchmark") -> pd.DataFrame:
+    """Calculate metrics for strategy and optionally benchmark, with alpha/beta."""
     strategy_metrics = calculate_single_equity_metrics(equity)
     strategy_metrics["Name"] = "Rising Assets"
     rows = [strategy_metrics]
@@ -862,6 +812,7 @@ def run_backtest_cached(
     guardrail_drop_pct: float,
     max_mode_info: Tuple[bool, str | None, str | None],
 ) -> BacktestResult:
+
     start = pd.Timestamp(start_iso)
     end = pd.Timestamp(end_iso)
     tickers = list(universe)
@@ -875,38 +826,18 @@ def run_backtest_cached(
     fetch_start = start - pd.Timedelta(days=buffer_days)
     exec_price_lookahead_days = 3
     fetch_end = end + pd.Timedelta(days=max(10, exec_price_lookahead_days + 3))
-
     tickers_all = tickers + ([benchmark] if benchmark and benchmark not in tickers else [])
+
     raw = fetch_price_data_robust_cached(
         tuple(tickers_all),
         fetch_start.date().isoformat(),
         fetch_end.date().isoformat(),
     )
 
-    # -------------------------
-    # Data quality module (DQ)
-    # 1) Fix GBp tickers with occasional GBP-priced prints (~100x low)
-    # 2) Normalize GBp -> GBP (divide by 100)
-    # 3) Detect likely permanent regime changes (e.g., splits); abort if found
-    # 4) Correct single-day spikes (existing threshold logic)
-    # -------------------------
-    raw_fixed, currency_report = fix_gbp_pence_unit_mix(raw, list(raw.columns))
-    raw_normalized = normalize_prices_to_gbp(raw_fixed, list(raw_fixed.columns))
+    currency_report: List[dict] = []
+    raw, currency_report = fix_gbp_unit_mix_extremes(raw, list(raw.columns))
 
-    breaks = detect_structural_breaks(raw_normalized, ratio_threshold=1.8, window=20)
-    if breaks:
-        details = "\n".join(
-            [
-                f"- {e['Ticker']} around {e['Break Date']} (abs ratio ~{e['Abs Ratio']:.2f}, factor guess={e['Factor Guess']})"
-                for e in breaks
-            ]
-        )
-        raise ValueError(
-            "Data quality: likely corporate action / permanent price regime change detected. "
-            "Backtest aborted so you can replace the affected ticker(s):\n" + details
-        )
-
-    cleaned, spike_report = validate_and_clean_prices(raw_normalized, threshold=spike_threshold)
+    cleaned, spike_report = validate_and_clean_prices(raw, threshold=spike_threshold)
 
     if benchmark:
         if benchmark not in cleaned.columns:
@@ -938,9 +869,11 @@ def run_backtest_cached(
 
     holdings: Dict[str, int] = {}
     cash = float(starting_capital)
+
     backfills: List[BackfillEvent] = []
     trade_fills: List[TradeFill] = []
     reb_rows: List[dict] = []
+
     equity = pd.Series(index=prices.index, dtype=float)
     issues: List[EquityIssue] = []
     prev_equity: Optional[float] = None
@@ -960,12 +893,12 @@ def run_backtest_cached(
         vol = calculate_volatility_asof(prices, signal_dt, window=63)
         valid_mom = mom_df["Momentum Score"].dropna()
 
-        # Valuation prices for mark-to-market (limited forward-fill)
+        # Valuation prices (limited forward-fill) for portfolio value before trading
         px_row_val_exec = prices_val.loc[:exec_dt].iloc[-1]
         port_val_before = compute_portfolio_value(holdings, px_row_val_exec, cash)
 
         exec_price_lookahead_days_local = 3
-        _px_row_exec_raw = prices.loc[:exec_dt].iloc[-1]
+        px_row_exec = prices.loc[:exec_dt].iloc[-1]
 
         if len(valid_mom) < 5:
             reb_rows.append(
@@ -983,7 +916,6 @@ def run_backtest_cached(
         else:
             top5 = valid_mom.nlargest(5).index.tolist()
 
-            # Build execution price row with forward lookahead for missing prices
             tickers_for_exec = sorted(set(holdings.keys()) | set(top5))
             px_exec: Dict[str, float] = {}
 
@@ -1086,12 +1018,23 @@ def run_backtest_cached(
             for f in trade_fills
         ]
     )
+
     rebalances_df = pd.DataFrame(reb_rows)
 
     issues_df = pd.DataFrame([i.__dict__ for i in issues]) if issues else pd.DataFrame(
-        columns=["date", "portfolio_value_raw", "portfolio_value_valued", "previous_value", "drop_pct", "missing_prices", "holdings_count", "note"]
+        columns=[
+            "date",
+            "portfolio_value_raw",
+            "portfolio_value_valued",
+            "previous_value",
+            "drop_pct",
+            "missing_prices",
+            "holdings_count",
+            "note",
+        ]
     )
 
+    # Extract max_mode_info for result
     is_max_mode, limiting_symbol, start_date_iso = max_mode_info
     start_date_for_result = date.fromisoformat(start_date_iso) if start_date_iso else None
 
@@ -1176,12 +1119,13 @@ def make_drawdown_fig(dd: pd.Series, dd_bench: Optional[pd.Series]) -> go.Figure
 
     fig.update_layout(
         height=320,
-        margin=dict(l=10, r=10, t=40, b=10),
+        margin=dict(l=10, r10=10, t=40, b=10),
         title="Drawdown (%)",
         xaxis_title="Date",
         yaxis_title="Drawdown %",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+
     fig.update_yaxes(ticksuffix="%")
     return fig
 
@@ -1223,12 +1167,11 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure)
         ws_notes.write(0, 0, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         ws_notes.write(1, 0, "Cash earns 0%.")
         ws_notes.write(2, 0, "Signals computed as-of prior month-end trading day; trades executed at month-end close.")
-
         if res.currency_report:
             tickers_fixed = sorted({r["Ticker"] for r in res.currency_report})
-            ws_notes.write(3, 0, f"GBp/GBP unit-mix corrections applied for: {', '.join(tickers_fixed)}")
+            ws_notes.write(3, 0, f"GBp/GBP unit-mix extreme corrections applied for: {', '.join(tickers_fixed)}")
         else:
-            ws_notes.write(3, 0, "GBp/GBP unit-mix corrections applied: none")
+            ws_notes.write(3, 0, "GBp/GBP unit-mix extreme corrections applied: none")
 
         # Add max mode note if applicable
         is_max_mode, limiting_symbol, start_date_used = res.max_mode_info
@@ -1262,7 +1205,7 @@ def default_universe() -> str:
 
 def app():
     st.set_page_config(page_title="Rising Assets Backtester", layout="wide")
-    st.title("Rising Assets — Streamlit Backtester 6.1")
+    st.title("Rising Assets — Streamlit Backtester 6.2")
 
     today_date = date.today()
     yesterday = today_date - timedelta(days=1)
@@ -1297,7 +1240,6 @@ def app():
         )
 
         use_calendar_month_end = st.checkbox("Calendar month-end momentum sampling", value=False)
-
         starting_capital = st.number_input("Starting capital", value=100000.0, step=1000.0)
 
         momentum_model = st.selectbox(
@@ -1446,7 +1388,7 @@ def app():
             if res.spike_report:
                 st.dataframe(pd.DataFrame(res.spike_report), use_container_width=True)
 
-            st.write(f"GBp/GBP unit-mix corrections: {len(res.currency_report)}")
+            st.write(f"GBp/GBP unit-mix extreme corrections: {len(res.currency_report)}")
             if res.currency_report:
                 st.dataframe(pd.DataFrame(res.currency_report), use_container_width=True)
 
