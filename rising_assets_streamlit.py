@@ -1119,7 +1119,7 @@ def make_drawdown_fig(dd: pd.Series, dd_bench: Optional[pd.Series]) -> go.Figure
 
     fig.update_layout(
         height=320,
-        margin=dict(l=10, r10=10, t=40, b=10),
+        margin=dict(l=10, r=10, t=40, b=10),
         title="Drawdown (%)",
         xaxis_title="Date",
         yaxis_title="Drawdown %",
