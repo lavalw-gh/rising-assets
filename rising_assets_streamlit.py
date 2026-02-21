@@ -1200,7 +1200,7 @@ def build_excel_bytes(res: BacktestResult, eq_fig: go.Figure, dd_fig: go.Figure)
 # =========================
 
 def default_universe() -> str:
-    return "VUSA.L,EQQQ.L,VUKE.L,VERX.L,VAPX.L,VJPN.L,VFEM.L,IUKP.L,IGLS.L,IGLT.L,SLXX.L,SGLN.L"
+    return "VUSA.L,EQQQ.L,VUKE.L,VERX.L,IASH.L,VAPX.L,VFEM.L,VJPN.L,IGLS.L,IGLT.L,SGLN.L,XMWX.L,COMX.L"
 
 
 def app():
