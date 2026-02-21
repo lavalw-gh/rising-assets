@@ -2,7 +2,7 @@
 Rising Assets Strategy — Streamlit Backtester (v6.3)
 
 Changes in v6.3:
-- Fix Extreme price corrections calculations
+- Fixed Bad data calculations
 - Adds chart data download for debugging
 
 Changes in v6.2:
@@ -276,7 +276,7 @@ def fix_gbp_unit_mix_extremes(
 							}
 						)
 						continue
-
+	
             # Method B: neighbor consistency (best for single-day flips)
             p = prev.loc[dt]
             n = nxt.loc[dt]
