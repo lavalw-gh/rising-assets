@@ -55,7 +55,7 @@ def parse_universe(text: str) -> List[str]:
     parts: List[str] = []
     for chunk in s.replace("\n", ",").split(","):
         t = chunk.strip()
-        if t:f2a
+        if t:
             parts.append(t)
 
     out: List[str] = []
