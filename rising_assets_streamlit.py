@@ -1,7 +1,8 @@
 """
-Rising Assets Strategy — Streamlit Backtester (v6.2a)
+Rising Assets Strategy — Streamlit Backtester (v6.3)
 
-Changes in v6.2:
+Changes in v6.3:
+- Fix Extreme price corrections calculations
 - Adds chart data download for debugging
 
 Changes in v6.2:
@@ -54,7 +55,7 @@ def parse_universe(text: str) -> List[str]:
     parts: List[str] = []
     for chunk in s.replace("\n", ",").split(","):
         t = chunk.strip()
-        if t:
+        if t:f2a
             parts.append(t)
 
     out: List[str] = []
@@ -193,7 +194,7 @@ def fix_gbp_unit_mix_extremes(
     ratio_min: float = 50.0,
     ratio_max: float = 150.0,
     tol: float = 0.25,
-    rolling_window: int = 30,
+    rolling_window: int = 90,
 ) -> Tuple[pd.DataFrame, List[dict]]:
     """Fix ~100x-too-low prints caused by GBp/GBP unit-mix issues.
 
@@ -241,19 +242,40 @@ def fix_gbp_unit_mix_extremes(
                     old_px = float(cur)
                     new_px = float(cur * factor)
                     fixed.at[dt, t] = new_px
-                    report.append(
-                        {
-                            "Ticker": t,
-                            "Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
-                            "Currency": "GBp",
-                            "Issue": "GBp/GBP unit-mix extreme (corrected)",
-                            "Old Price": old_px,
-                            "New Price": new_px,
-                            "Factor": factor,
-                            "Method": "RollingMedian",
-                        }
-                    )
-                    continue
+
+					report.append(
+						{
+							"Ticker": t,
+							"Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+							"Currency": "GBp",
+							"Issue": "GBp/GBP unit-mix extreme (corrected)",
+							"Old Price": old_px,
+							"New Price": new_px,
+							"Factor": factor,
+							"Method": "RollingMedian",
+						}
+					)
+					continue
+				# Method A2: global median — handles sustained bad-price runs that contaminate the rolling window
+				if pd.notna(global_med) and global_med > 0:
+					ratio_g = float(global_med / cur)
+					if ratio_min <= ratio_g <= ratio_max and abs(((cur * factor) / global_med) - 1.0) <= tol:
+						old_px = float(cur)
+						new_px = float(cur * factor)
+						fixed.at[dt, t] = new_px
+						report.append(
+							{
+								"Ticker": t,
+								"Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+								"Currency": "GBp",
+								"Issue": "GBp/GBP unit-mix extreme (corrected)",
+								"Old Price": old_px,
+								"New Price": new_px,
+								"Factor": factor,
+								"Method": "GlobalMedian",
+							}
+						)
+						continue
 
             # Method B: neighbor consistency (best for single-day flips)
             p = prev.loc[dt]
@@ -1225,7 +1247,7 @@ def default_universe() -> str:
 
 def app():
     st.set_page_config(page_title="Rising Assets Backtester", layout="wide")
-    st.title("Rising Assets — Streamlit Backtester 6.2a")
+    st.title("Rising Assets — Streamlit Backtester 6.3")
 
     today_date = date.today()
     yesterday = today_date - timedelta(days=1)
