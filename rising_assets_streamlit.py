@@ -1,5 +1,8 @@
 """
-Rising Assets Strategy — Streamlit Backtester (v6.2)
+Rising Assets Strategy — Streamlit Backtester (v6.2a)
+
+Changes in v6.2:
+- Adds chart data download for debugging
 
 Changes in v6.2:
 - Adds DQ fix for GBp/GBP unit-mix extremes (e.g., SGLN.L prints ~100x too low); logs corrections to Streamlit + Excel Notes.
@@ -793,6 +796,7 @@ class BacktestResult:
     first_exec_date: pd.Timestamp
     max_mode_info: Tuple[bool, str | None, date | None]
     benchmark_name: str
+    component_daily: pd.DataFrame
 
 
 @st.cache_data(show_spinner=False)
@@ -877,6 +881,7 @@ def run_backtest_cached(
     equity = pd.Series(index=prices.index, dtype=float)
     issues: List[EquityIssue] = []
     prev_equity: Optional[float] = None
+    component_rows: Dict[pd.Timestamp, Dict[str, float]] = {}
 
     if bench_px is not None:
         bench_px = bench_px.dropna().sort_index()
@@ -996,10 +1001,24 @@ def run_backtest_cached(
                     eq_used = float(prev_equity)
 
             equity.loc[dt] = float(eq_used)
+            _crow: Dict[str, float] = {"Cash": float(cash)}
+            for _t, _sh in holdings.items():
+                _px_t = px_val.get(_t, np.nan)
+                _crow[_t] = int(_sh) * float(_px_t) if pd.notna(_px_t) else 0.0
+            _crow["Total"] = float(eq_used)
+            component_rows[pd.Timestamp(dt)] = _crow
             prev_equity = float(eq_used)
 
     first_exec_dt = exec_month_ends[0]
     equity = equity.loc[(equity.index >= first_exec_dt) & (equity.index <= exec_month_ends[-1])].dropna()
+    if component_rows:
+        component_daily = pd.DataFrame(component_rows).T.sort_index()
+        component_daily.index.name = "Date"
+        component_daily = component_daily.loc[
+            (component_daily.index >= first_exec_dt) & (component_daily.index <= exec_month_ends[-1])
+        ].fillna(0.0)
+    else:
+        component_daily = pd.DataFrame()
 
     bench_equity = None
     if bench_px is not None and not equity.empty:
@@ -1053,6 +1072,7 @@ def run_backtest_cached(
         first_exec_date=first_exec_dt,
         max_mode_info=(is_max_mode, limiting_symbol, start_date_for_result),
         benchmark_name=benchmark if benchmark else "Benchmark",
+        component_daily=component_daily,
     )
 
 
@@ -1205,7 +1225,7 @@ def default_universe() -> str:
 
 def app():
     st.set_page_config(page_title="Rising Assets Backtester", layout="wide")
-    st.title("Rising Assets — Streamlit Backtester 6.2")
+    st.title("Rising Assets — Streamlit Backtester 6.2a")
 
     today_date = date.today()
     yesterday = today_date - timedelta(days=1)
@@ -1376,12 +1396,22 @@ def app():
 
         excel_bytes = build_excel_bytes(res, eq_fig, dd_fig)
         filename = f"RisingAssets_Backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
         st.download_button(
             label="Download Excel",
             data=excel_bytes,
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+        if not res.component_daily.empty:
+            _csv_bytes = res.component_daily.to_csv().encode("utf-8")
+            _csv_filename = f"RisingAssets_ChartData_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                label="Download chart data",
+                data=_csv_bytes,
+                file_name=_csv_filename,
+                mime="text/csv",
+            )
 
         with st.expander("Data quality logs"):
             st.write(f"Price spikes corrected: {len(res.spike_report)}")
@@ -1395,7 +1425,6 @@ def app():
             st.write(f"Backfills applied: {len(res.backfills)}")
             if res.backfills:
                 st.dataframe(pd.DataFrame([e.__dict__ for e in res.backfills]), use_container_width=True)
-
 
 if __name__ == "__main__":
     app()
